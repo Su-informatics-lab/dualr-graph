@@ -517,6 +517,26 @@ def code_matches(code_str, prefixes):
     return any(c.startswith(p.upper().replace(".", "")) for p in prefixes)
 
 
+def resolve_cols(csv_path, wanted):
+    """Peek at CSV header, return usecols list in the file's actual case.
+
+    wanted: list of column names in any case (e.g. ["person_id", "PERSON_ID"])
+    Returns: list of column names as they appear in the file header.
+    Raises ValueError if any wanted column is missing (case-insensitive).
+    """
+    header = pd.read_csv(csv_path, nrows=0).columns.tolist()
+    lower_map = {c.lower(): c for c in header}
+    resolved = []
+    for w in wanted:
+        actual = lower_map.get(w.lower())
+        if actual is None:
+            raise ValueError(
+                f"Column '{w}' not found in {csv_path}. " f"Available: {header[:20]}"
+            )
+        resolved.append(actual)
+    return resolved
+
+
 # ═══════════════════════════════════════════════════════════════════
 def main():
     print("=" * 70)
@@ -536,11 +556,15 @@ def main():
     # Collect ICI exposures: person_id, date, class
     ici_rows = []
     n_drug_total = 0
+    drug_path = f"{DATA}/r6335_drug_exposure.csv"
+    drug_cols = resolve_cols(
+        drug_path, ["person_id", "drug_exposure_start_date", "drug_source_value"]
+    )
     for chunk in pd.read_csv(
-        f"{DATA}/r6335_drug_exposure.csv",
+        drug_path,
         low_memory=False,
         chunksize=CHUNK,
-        usecols=["PERSON_ID", "DRUG_EXPOSURE_START_DATE", "DRUG_SOURCE_VALUE"],
+        usecols=drug_cols,
     ):
         n_drug_total += len(chunk)
         chunk.columns = [c.lower() for c in chunk.columns]
@@ -608,11 +632,13 @@ def main():
     patient_codes = {}  # pid → set of normalized ICD codes
 
     n_cond_total = 0
+    cond_path = f"{DATA}/r6335_condition_occurrence.csv"
+    cond_cols = resolve_cols(cond_path, ["person_id", "condition_source_value"])
     for chunk in pd.read_csv(
-        f"{DATA}/r6335_condition_occurrence.csv",
+        cond_path,
         low_memory=False,
         chunksize=CHUNK,
-        usecols=["PERSON_ID", "CONDITION_SOURCE_VALUE"],
+        usecols=cond_cols,
     ):
         n_cond_total += len(chunk)
         chunk.columns = [c.lower() for c in chunk.columns]
@@ -660,11 +686,15 @@ def main():
     print("=" * 70)
 
     # Find creatinine concept IDs from concept table (small filtered read)
+    concept_path = f"{DATA}/r6335_concept.csv"
+    concept_cols = resolve_cols(
+        concept_path, ["concept_id", "concept_name", "vocabulary_id"]
+    )
     concept_cr = pd.read_csv(
-        f"{DATA}/r6335_concept.csv",
+        concept_path,
         encoding="cp1252",
         low_memory=False,
-        usecols=["CONCEPT_ID", "CONCEPT_NAME", "VOCABULARY_ID"],
+        usecols=concept_cols,
     )
     concept_cr.columns = [c.lower() for c in concept_cr.columns]
     cr_mask = concept_cr.concept_name.str.contains(
@@ -682,17 +712,16 @@ def main():
     valid_pid_set = set(ici_index.person_id)
     cr_rows = []
     n_meas_total = 0
-
+    meas_path = f"{DATA}/r6335_measurement.csv"
+    meas_cols = resolve_cols(
+        meas_path,
+        ["person_id", "measurement_concept_id", "measurement_date", "value_as_number"],
+    )
     for chunk in pd.read_csv(
-        f"{DATA}/r6335_measurement.csv",
+        meas_path,
         low_memory=False,
         chunksize=CHUNK,
-        usecols=[
-            "PERSON_ID",
-            "MEASUREMENT_CONCEPT_ID",
-            "MEASUREMENT_DATE",
-            "VALUE_AS_NUMBER",
-        ],
+        usecols=meas_cols,
     ):
         n_meas_total += len(chunk)
         chunk.columns = [c.lower() for c in chunk.columns]
@@ -773,16 +802,21 @@ def main():
     print("=" * 70)
 
     # Demographics from person table
-    person = pd.read_csv(
-        f"{DATA}/r6335_person.csv",
-        low_memory=False,
-        usecols=[
-            "PERSON_ID",
-            "YEAR_OF_BIRTH",
-            "GENDER_CONCEPT_ID",
-            "RACE_CONCEPT_ID",
-            "ETHNICITY_CONCEPT_ID",
+    person_path = f"{DATA}/r6335_person.csv"
+    person_cols = resolve_cols(
+        person_path,
+        [
+            "person_id",
+            "year_of_birth",
+            "gender_concept_id",
+            "race_concept_id",
+            "ethnicity_concept_id",
         ],
+    )
+    person = pd.read_csv(
+        person_path,
+        low_memory=False,
+        usecols=person_cols,
     )
     person.columns = [c.lower() for c in person.columns]
     person = person[person.person_id.isin(cohort.person_id)]
@@ -831,10 +865,10 @@ def main():
     # Nephrotoxins (chunked drug scan, concomitant ±30d)
     nephro_pids = set()
     for chunk in pd.read_csv(
-        f"{DATA}/r6335_drug_exposure.csv",
+        drug_path,
         low_memory=False,
         chunksize=CHUNK,
-        usecols=["PERSON_ID", "DRUG_EXPOSURE_START_DATE", "DRUG_SOURCE_VALUE"],
+        usecols=drug_cols,
     ):
         chunk.columns = [c.lower() for c in chunk.columns]
         chunk = chunk[chunk.person_id.isin(cohort_pids)]
