@@ -1,970 +1,952 @@
 #!/usr/bin/env python3
 """
-01_etl_quartz.py — Self-contained ETL for Graph AI.
+Post-ICI AKI × SDoH — AoU ETL (v2 — NCI-CCI scoring fix)
+Runs on AoU Researcher Workbench (Controlled Tier).
 
-Runs on Quartz. Reads raw INPC OMOP CSV dump, produces feature matrix
-for SCP to Tempest. Zero dependencies on post_ici_aki_disparity.
+Adapted from aou_covid/01_aou_etl.py (Wang et al.)
+Design: study_design_postICI_AKI_SDoH_v2.md
 
-Data source: /N/project/depot/hw56/irAKI_data/structured_data/
-  r6335_person.csv
-  r6335_drug_exposure.csv
-  r6335_condition_occurrence.csv
-  r6335_measurement.csv
-  r6335_concept.csv  (encoding: cp1252)
+Steps:
+  1. ICI-treated cancer patient cohort + AKI phenotyping
+  2. Demographics
+  3. NCI Charlson Comorbidity Index (14 conditions) ← FIXED v2
+  4. SDoH (Basics Survey)
+  5. Cancer type + ICI class + concomitant nephrotoxins
+  6. Matching variables
+  7. Regression base assembly
 
-Output (→ SCP to Tempest):
-  data/feature_matrix.pt    [F, N] float32
-  data/feature_names.json   ordered node names
-  data/binary_mask.pt       [F] bool
-  data/cohort_meta.csv      person_id + AKI labels (3m/6m/12m)
+CCI FIX LOG (v2, 2026-05-16):
+  - REMOVED hierarchy pre-processing (zeroing raw flags)
+  - FIXED MI scoring: OR logic (max 1pt), was additive (2pt)
+  - FIXED Paralysis/CVD: score independently (was hierarchical)
+  - ADDED NCI continuous index alongside Charlson integer score
+  - Uses shared nci_cci_scoring.py module
 
-Usage (on Quartz):
-  module load r/4.5.1
-  python 01_etl_quartz.py
-  scp -r data/ tempest:~/graphai_ici_aki/data/
+Usage: python 01_ici_aki_etl.py
+Output: results/ici_aki/*.csv (01–07)
+Next:   Rscript 01b_psm.R ici_aki
 """
 
-import json
 import os
+import sys
 import warnings
+
+warnings.filterwarnings("ignore", message=".*read_gbq is deprecated.*")
 
 import numpy as np
 import pandas as pd
-import torch
 
-warnings.filterwarnings("ignore")
+# Import corrected NCI-CCI scoring
+from nci_cci_scoring import (
+    NCI_CCI_CONDITIONS,
+    NCI_CODESETS,
+    compute_charlson_score,
+    compute_nci_index,
+)
 
-# ═══════════════════════════════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════════════════════════════
-DATA = "/N/project/depot/hw56/irAKI_data/structured_data"
-OUT = "data"
-os.makedirs(OUT, exist_ok=True)
+# ── Environment ───────────────────────────────────────────────────
+CDR = os.environ.get("WORKSPACE_CDR", "")
+if not CDR:
+    print("ERROR: WORKSPACE_CDR not set. Run on AoU Workbench.")
+    sys.exit(1)
 
-MIN_PREVALENCE = 0.01  # drop NCI-CCI flags below this
+RESULTS = "results/ici_aki"
+os.makedirs(RESULTS, exist_ok=True)
 
-# AKI windows
-AKI_WINDOWS = {
-    "aki_3m": 90,
-    "aki_6m": 180,
-    "aki_12m": 365,
-}
-PRIMARY_WINDOW = "aki_12m"
-CR_RATIO_THRESHOLD = 2.0  # Cr ≥ 2.0× baseline
-
-# ═══════════════════════════════════════════════════════════════════
-# ICI DRUG MAPPING
-# ═══════════════════════════════════════════════════════════════════
-ICI_KEYWORDS = {
-    "anti_pd1": [
-        "nivolumab",
-        "pembrolizumab",
-        "cemiplimab",
-        "dostarlimab",
-        "retifanlimab",
-        "toripalimab",
-        "tislelizumab",
-    ],
-    "anti_pdl1": ["atezolizumab", "durvalumab", "avelumab"],
-    "anti_ctla4": ["ipilimumab", "tremelimumab"],
-    "anti_lag3": ["relatlimab"],
-}
+print("=" * 70)
+print("POST-ICI AKI × SDoH — AoU ETL (v2 — NCI-CCI fix)")
+print("=" * 70)
+print(f"  CDR: {CDR}")
+print(f"  Output: {RESULTS}/")
 
 
-def classify_ici(drug_name: str) -> str | None:
-    """Classify a drug name string into ICI class."""
-    if not isinstance(drug_name, str):
-        return None
-    low = drug_name.lower()
-    for cls, keywords in ICI_KEYWORDS.items():
-        for kw in keywords:
-            if kw in low:
-                return cls
-    return None
+def save(df, filename):
+    path = os.path.join(RESULTS, filename)
+    df.to_csv(path, index=False)
+    print(f"  Saved: {path} ({len(df):,} rows, {df.shape[1]} cols)")
 
 
-# ═══════════════════════════════════════════════════════════════════
-# NCI-CCI 14-CONDITION CODE SETS
-# (Identical to nci_cci_scoring.py — reproduced here for independence)
-# ═══════════════════════════════════════════════════════════════════
-NCI_CCI = {
-    "Acute_MI": {
-        "9": ["410"],
-        "10": ["I21", "I22"],
-    },
-    "History_MI": {
-        "9": ["412"],
-        "10": ["I252"],
-    },
-    "CHF": {
-        "9": [
-            "39891",
-            "4280",
-            "4281",
-            "42820",
-            "42821",
-            "42822",
-            "42823",
-            "42830",
-            "42831",
-            "42832",
-            "42833",
-            "42840",
-            "42841",
-            "42842",
-            "42843",
-            "4289",
-        ],
-        "10": [
-            "I0981",
-            "I110",
-            "I130",
-            "I132",
-            "I255",
-            "I420",
-            "I425",
-            "I426",
-            "I427",
-            "I428",
-            "I429",
-            "I43",
-            "I50",
-            "P290",
-        ],
-    },
-    "PVD": {
-        "9": [
-            "0930",
-            "4373",
-            "440",
-            "441",
-            "4431",
-            "4432",
-            "4438",
-            "4439",
-            "4471",
-            "5571",
-            "5579",
-            "V434",
-        ],
-        "10": [
-            "I70",
-            "I71",
-            "I731",
-            "I738",
-            "I739",
-            "I771",
-            "I790",
-            "I792",
-            "K551",
-            "K558",
-            "K559",
-            "Z958",
-            "Z959",
-        ],
-    },
-    "CVD": {
-        "9": ["36234", "430", "431", "432", "433", "434", "435", "436", "437", "438"],
-        "10": [
-            "G45",
-            "G46",
-            "H340",
-            "H341",
-            "H342",
-            "I60",
-            "I61",
-            "I62",
-            "I63",
-            "I64",
-            "I65",
-            "I66",
-            "I67",
-            "I68",
-            "I69",
-        ],
-    },
-    "COPD": {
-        "9": [
-            "4168",
-            "4169",
-            "490",
-            "491",
-            "492",
-            "493",
-            "494",
-            "495",
-            "496",
-            "500",
-            "501",
-            "502",
-            "503",
-            "504",
-            "505",
-            "5064",
-            "5081",
-            "5088",
-        ],
-        "10": [
-            "I278",
-            "I279",
-            "J40",
-            "J41",
-            "J42",
-            "J43",
-            "J44",
-            "J45",
-            "J46",
-            "J47",
-            "J60",
-            "J61",
-            "J62",
-            "J63",
-            "J64",
-            "J65",
-            "J66",
-            "J67",
-            "J684",
-            "J701",
-            "J703",
-        ],
-    },
-    "Dementia": {
-        "9": ["290", "2941", "3312"],
-        "10": ["F01", "F02", "F03", "F051", "G30", "G311", "G312", "G3101", "G3109"],
-    },
-    "Paralysis": {
-        "9": [
-            "3341",
-            "342",
-            "343",
-            "3440",
-            "3441",
-            "3442",
-            "3443",
-            "3444",
-            "3445",
-            "3446",
-            "3449",
-        ],
-        "10": [
-            "G041",
-            "G114",
-            "G801",
-            "G802",
-            "G81",
-            "G82",
-            "G830",
-            "G831",
-            "G832",
-            "G833",
-            "G834",
-            "G839",
-        ],
-    },
-    "Diabetes": {
-        "9": ["2500", "2501", "2502", "2503", "2508", "2509"],
-        "10": [
-            "E100",
-            "E101",
-            "E106",
-            "E108",
-            "E109",
-            "E110",
-            "E111",
-            "E116",
-            "E118",
-            "E119",
-            "E120",
-            "E121",
-            "E126",
-            "E128",
-            "E129",
-            "E130",
-            "E131",
-            "E136",
-            "E138",
-            "E139",
-            "E140",
-            "E141",
-            "E146",
-            "E148",
-            "E149",
-        ],
-    },
-    "Diabetes_Complicated": {
-        "9": ["2504", "2505", "2506", "2507"],
-        "10": [
-            "E102",
-            "E103",
-            "E104",
-            "E105",
-            "E112",
-            "E113",
-            "E114",
-            "E115",
-            "E122",
-            "E123",
-            "E124",
-            "E125",
-            "E132",
-            "E133",
-            "E134",
-            "E135",
-            "E142",
-            "E143",
-            "E144",
-            "E145",
-        ],
-    },
-    "Renal_Disease": {
-        "9": [
-            "40301",
-            "40311",
-            "40391",
-            "40402",
-            "40403",
-            "40412",
-            "40413",
-            "40492",
-            "40493",
-            "582",
-            "5830",
-            "5831",
-            "5832",
-            "5834",
-            "5836",
-            "5837",
-            "585",
-            "586",
-            "5880",
-            "V420",
-            "V451",
-            "V56",
-        ],
-        "10": [
-            "I120",
-            "I131",
-            "N032",
-            "N033",
-            "N034",
-            "N035",
-            "N036",
-            "N037",
-            "N052",
-            "N053",
-            "N054",
-            "N055",
-            "N056",
-            "N057",
-            "N18",
-            "N19",
-            "N250",
-            "Z490",
-            "Z491",
-            "Z492",
-            "Z940",
-            "Z992",
-        ],
-    },
-    "Liver_Disease_Mild": {
-        "9": [
-            "07022",
-            "07023",
-            "07032",
-            "07033",
-            "07044",
-            "07054",
-            "0706",
-            "0709",
-            "570",
-            "571",
-            "5733",
-            "5734",
-            "5738",
-            "5739",
-            "V427",
-        ],
-        "10": [
-            "B18",
-            "K700",
-            "K701",
-            "K702",
-            "K703",
-            "K709",
-            "K713",
-            "K714",
-            "K715",
-            "K717",
-            "K73",
-            "K74",
-            "K760",
-            "K762",
-            "K763",
-            "K764",
-            "K768",
-            "K769",
-            "Z944",
-        ],
-    },
-    "Liver_Disease_Moderate_Severe": {
-        "9": [
-            "4560",
-            "4561",
-            "4562",
-            "5722",
-            "5723",
-            "5724",
-            "5725",
-            "5726",
-            "5727",
-            "5728",
-        ],
-        "10": [
-            "I850",
-            "I859",
-            "I864",
-            "I982",
-            "K704",
-            "K711",
-            "K721",
-            "K729",
-            "K765",
-            "K766",
-            "K767",
-        ],
-    },
-    "Peptic_Ulcer_Disease": {
-        "9": ["531", "532", "533", "534"],
-        "10": ["K25", "K26", "K27", "K28"],
-    },
-    "Rheumatic_Disease": {
-        "9": [
-            "4465",
-            "7100",
-            "7101",
-            "7102",
-            "7103",
-            "7104",
-            "7140",
-            "7141",
-            "7142",
-            "7148",
-            "725",
-        ],
-        "10": ["M05", "M06", "M315", "M32", "M33", "M34", "M351", "M353", "M360"],
-    },
-    "AIDS": {
-        "9": ["042"],
-        "10": ["B20"],
-    },
-}
-
-NCI_WEIGHTS = {
-    "Acute_MI": 1,
-    "History_MI": 1,
-    "CHF": 1,
-    "PVD": 1,
-    "CVD": 1,
-    "COPD": 1,
-    "Dementia": 1,
-    "Paralysis": 1,
-    "Diabetes": 1,
-    "Diabetes_Complicated": 1,
-    "Renal_Disease": 1,
-    "Liver_Disease_Mild": 1,
-    "Liver_Disease_Moderate_Severe": 3,
-    "Peptic_Ulcer_Disease": 1,
-    "Rheumatic_Disease": 1,
-    "AIDS": 6,
-}
-
-# Nephrotoxin concept names (substring match)
-NEPHROTOXIN_KEYWORDS = [
-    "ibuprofen",
-    "naproxen",
-    "diclofenac",
-    "indomethacin",
-    "meloxicam",
-    "celecoxib",
-    "ketorolac",
-    "piroxicam",  # NSAIDs
-    "gentamicin",
-    "tobramycin",
-    "amikacin",
-    "vancomycin",  # aminoglycosides
-    "amphotericin",
-    "cisplatin",
-    "carboplatin",  # other nephrotoxins
-]
-
-# Cancer ICD codes (for cohort confirmation)
-CANCER_ICD10_PREFIXES = ["C", "D0"]
-
-# ESKD exclusion
-ESKD_ICD9 = ["5856", "V420", "V451", "V56"]
-ESKD_ICD10 = ["N186", "Z940", "Z490", "Z491", "Z492", "Z992", "T861"]
+def q(sql):
+    return pd.read_gbq(sql, dialect="standard")
 
 
 def parse_date(s):
-    return pd.to_datetime(s, format="mixed", dayfirst=False, errors="coerce")
-
-
-def prefix_match(code: str, prefixes: list) -> bool:
-    """Check if ICD code starts with any prefix (after removing dots)."""
-    c = str(code).upper().replace(".", "")
-    return any(c.startswith(p.upper().replace(".", "")) for p in prefixes)
+    return pd.to_datetime(s, errors="coerce")
 
 
 # ═══════════════════════════════════════════════════════════════════
-# MAIN ETL
+# STEP 1: ICI COHORT + AKI PHENOTYPING
 # ═══════════════════════════════════════════════════════════════════
-def main():
-    print("=" * 70)
-    print("GRAPH AI — INPC ETL (Quartz)")
-    print("=" * 70)
-    print(f"  Data: {DATA}")
-    print(f"  Output: {OUT}/")
+print("\n" + "=" * 70)
+print("STEP 1: ICI Cohort + AKI Phenotyping")
+print("=" * 70)
 
-    # ── Load tables ───────────────────────────────────────────────
-    print("\n  Loading tables...")
-    person = pd.read_csv(f"{DATA}/r6335_person.csv", low_memory=False)
-    print(f"    person: {len(person):,}")
+# ── 1a. Find ICI drug concept IDs via name matching ───────────────
+ICI_AGENTS = [
+    "nivolumab",
+    "pembrolizumab",
+    "atezolizumab",
+    "durvalumab",
+    "avelumab",
+    "cemiplimab",
+    "ipilimumab",
+    "tremelimumab",
+    "dostarlimab",
+    "relatlimab",
+]
 
-    drug = pd.read_csv(
-        f"{DATA}/r6335_drug_exposure.csv",
-        low_memory=False,
-        usecols=[
+agent_likes = " OR ".join([f"LOWER(c.concept_name) LIKE '%{a}%'" for a in ICI_AGENTS])
+ici_concepts_sql = f"""
+SELECT DISTINCT c.concept_id, c.concept_name
+FROM `{CDR}.concept` c
+WHERE ({agent_likes})
+  AND c.domain_id = 'Drug'
+  AND c.standard_concept = 'S'
+"""
+ici_concepts = q(ici_concepts_sql)
+ici_concept_ids = tuple(ici_concepts.concept_id.tolist())
+print(f"  Found {len(ici_concept_ids)} ICI drug concept IDs")
+
+if len(ici_concept_ids) == 0:
+    print("FATAL: No ICI concepts found. Check CDR version.")
+    sys.exit(1)
+
+# ── 1b. ICI-treated patients ─────────────────────────────────────
+ici_sql = f"""
+SELECT
+  de.person_id,
+  MIN(de.drug_exposure_start_date) AS ici_index_date,
+  ARRAY_AGG(DISTINCT LOWER(c.concept_name) ORDER BY LOWER(c.concept_name)) AS ici_drugs
+FROM `{CDR}.drug_exposure` de
+JOIN `{CDR}.concept` c ON c.concept_id = de.drug_concept_id
+WHERE de.drug_concept_id IN ({','.join(str(x) for x in ici_concept_ids)})
+GROUP BY de.person_id
+"""
+ici_patients = q(ici_sql)
+ici_patients["ici_index_date"] = parse_date(ici_patients["ici_index_date"])
+print(f"  ICI-treated patients: {len(ici_patients):,}")
+
+# ── 1c. Cancer diagnosis filter ──────────────────────────────────
+cancer_sql = f"""
+SELECT DISTINCT co.person_id
+FROM `{CDR}.condition_occurrence` co
+JOIN `{CDR}.concept` c ON c.concept_id = co.condition_source_concept_id
+WHERE c.vocabulary_id = 'ICD10CM'
+  AND (c.concept_code LIKE 'C%' OR c.concept_code LIKE 'D0%'
+       OR c.concept_code LIKE 'D1%' OR c.concept_code LIKE 'D2%'
+       OR c.concept_code LIKE 'D3%' OR c.concept_code LIKE 'D4%')
+"""
+cancer_pts = q(cancer_sql)
+ici_cancer = ici_patients[ici_patients.person_id.isin(cancer_pts.person_id)]
+print(f"  ICI + cancer: {len(ici_cancer):,}")
+
+# ── 1d. Basics Survey filter ─────────────────────────────────────
+basics_sql = f"""
+SELECT DISTINCT person_id
+FROM `{CDR}.observation`
+WHERE observation_source_concept_id = 1585845
+"""
+basics_pts = q(basics_sql)
+ici_cancer_basics = ici_cancer[ici_cancer.person_id.isin(basics_pts.person_id)]
+print(f"  ICI + cancer + Basics Survey: {len(ici_cancer_basics):,}")
+
+# ── 1e. Creatinine extraction ────────────────────────────────────
+cr_concept = 3016723  # LOINC 2160-0
+cr_sql = f"""
+SELECT
+  m.person_id,
+  m.measurement_date,
+  m.value_as_number,
+  m.unit_concept_id
+FROM `{CDR}.measurement` m
+WHERE m.measurement_concept_id = {cr_concept}
+  AND m.value_as_number IS NOT NULL
+  AND m.value_as_number > 0
+  AND m.value_as_number < 30
+"""
+cr_all = q(cr_sql)
+cr_all["measurement_date"] = parse_date(cr_all["measurement_date"])
+cr_all = cr_all[cr_all.person_id.isin(ici_cancer_basics.person_id)]
+print(f"  Creatinine measurements (ICI patients): {len(cr_all):,}")
+
+# ── 1f. Baseline + follow-up Cr ──────────────────────────────────
+cr_merged = cr_all.merge(
+    ici_cancer_basics[["person_id", "ici_index_date"]], on="person_id"
+)
+cr_merged["days_from_ici"] = (
+    cr_merged.measurement_date - cr_merged.ici_index_date
+).dt.days
+
+# Baseline: median Cr in [-365, -7]
+baseline_cr = cr_merged[
+    (cr_merged.days_from_ici >= -365) & (cr_merged.days_from_ici <= -7)
+]
+baseline = (
+    baseline_cr.groupby("person_id")
+    .agg(
+        baseline_cr=("value_as_number", "median"),
+        n_baseline=("value_as_number", "count"),
+    )
+    .reset_index()
+)
+print(f"  Patients with baseline Cr: {len(baseline):,}")
+
+# Follow-up: Cr in [1, 365]
+followup_cr = cr_merged[
+    (cr_merged.days_from_ici >= 1) & (cr_merged.days_from_ici <= 365)
+]
+followup = (
+    followup_cr.groupby("person_id")
+    .agg(
+        max_followup_cr=("value_as_number", "max"),
+        n_followup=("value_as_number", "count"),
+    )
+    .reset_index()
+)
+print(f"  Patients with follow-up Cr: {len(followup):,}")
+
+# Merge baseline + follow-up
+eligible = ici_cancer_basics.merge(baseline, on="person_id").merge(
+    followup, on="person_id"
+)
+
+# ── 1g. ESKD / transplant exclusion ──────────────────────────────
+eskd_sql = f"""
+SELECT DISTINCT co.person_id
+FROM `{CDR}.condition_occurrence` co
+JOIN `{CDR}.concept` c ON c.concept_id = co.condition_source_concept_id
+WHERE c.vocabulary_id = 'ICD10CM'
+  AND (c.concept_code IN ('N186')
+       OR c.concept_code LIKE 'Z992%'
+       OR c.concept_code LIKE 'Z490%' OR c.concept_code LIKE 'Z491%' OR c.concept_code LIKE 'Z492%'
+       OR c.concept_code LIKE 'Z940%')
+"""
+eskd_pts = q(eskd_sql)
+pre_eskd = len(eligible)
+eligible = eligible[~eligible.person_id.isin(eskd_pts.person_id)]
+eligible = eligible[eligible.baseline_cr < 4.0]
+print(f"  Excluded ESKD/transplant/baseline≥4: {pre_eskd - len(eligible)}")
+print(f"  Eligible cohort: {len(eligible):,}")
+
+# ── 1h. AKI phenotyping ──────────────────────────────────────────
+eligible["max_cr_ratio"] = eligible.max_followup_cr / eligible.baseline_cr
+eligible["max_delta_cr"] = eligible.max_followup_cr - eligible.baseline_cr
+
+# Primary: Cr ≥1.5× baseline (KDIGO Stage 1)
+eligible["severity"] = (eligible.max_cr_ratio >= 1.5).astype(int)
+
+# Sensitivity thresholds
+eligible["aki_delta03"] = (eligible.max_delta_cr >= 0.3).astype(int)
+eligible["aki_kdigo2"] = (eligible.max_cr_ratio >= 2.0).astype(int)
+eligible["aki_kdigo3"] = (eligible.max_cr_ratio >= 3.0).astype(int)
+
+# 180-day window
+followup_180 = cr_merged[
+    (cr_merged.days_from_ici >= 1) & (cr_merged.days_from_ici <= 180)
+]
+max_180 = followup_180.groupby("person_id").value_as_number.max().reset_index()
+max_180.columns = ["person_id", "max_cr_180"]
+eligible = eligible.merge(max_180, on="person_id", how="left")
+eligible["aki_180d"] = (
+    ((eligible.max_cr_180 / eligible.baseline_cr) >= 1.5).astype(int).fillna(0)
+)
+
+cases = eligible.severity.sum()
+controls = (eligible.severity == 0).sum()
+print(f"  Cases (Cr ≥1.5×): {cases:,} ({cases/len(eligible)*100:.1f}%)")
+print(f"  Controls:          {controls:,}")
+
+save(eligible, "01_eligible_cohort.csv")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 2: DEMOGRAPHICS
+# ═══════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("STEP 2: Demographics")
+print("=" * 70)
+
+demo_sql = f"""
+SELECT
+  p.person_id,
+  p.year_of_birth,
+  p.gender_concept_id,
+  p.race_concept_id,
+  p.ethnicity_concept_id,
+  p.sex_at_birth_concept_id
+FROM `{CDR}.person` p
+WHERE p.person_id IN ({','.join(str(x) for x in eligible.person_id.tolist())})
+"""
+demo = q(demo_sql)
+
+# Sex at birth
+sex_map = {45880669: "Male", 45878463: "Female"}
+demo["sex_at_birth"] = demo.sex_at_birth_concept_id.map(sex_map).fillna("Other")
+
+# Race
+race_sql = f"""
+SELECT person_id, answer.concept_name AS race_name
+FROM `{CDR}.ds_survey` WHERE survey = 'The Basics'
+  AND question_concept_id = 1586140
+  AND person_id IN ({','.join(str(x) for x in eligible.person_id.tolist())})
+"""
+try:
+    race_df = q(race_sql)
+except:
+    race_concept_map = {
+        8516: "Black",
+        8515: "Asian",
+        8527: "White",
+        8557: "Native_Hawaiian_PI",
+        8657: "AIAN",
+    }
+    demo["race"] = demo.race_concept_id.map(race_concept_map).fillna("Other")
+    race_df = None
+
+if race_df is not None and len(race_df) > 0:
+
+    def classify_race(name):
+        if pd.isna(name):
+            return "Other"
+        n = str(name).lower()
+        if "black" in n or "african" in n:
+            return "Black"
+        if "white" in n:
+            return "White"
+        if "asian" in n:
+            return "Asian"
+        if "hawaiian" in n or "pacific" in n:
+            return "Native_Hawaiian_PI"
+        if "american indian" in n or "alaska" in n:
+            return "AIAN"
+        if "hispanic" in n or "latino" in n:
+            return "Hispanic"
+        return "Other"
+
+    race_df["race"] = race_df.race_name.apply(classify_race)
+    race_final = race_df.groupby("person_id").race.first().reset_index()
+    demo = demo.merge(race_final, on="person_id", how="left")
+    if "race" not in demo.columns or demo.race.isna().all():
+        demo["race"] = "Other"
+else:
+    if "race" not in demo.columns:
+        demo["race"] = "Other"
+
+demo.race = demo.race.fillna("Other")
+
+# Ethnicity
+eth_map = {38003563: "Hispanic", 38003564: "Not_Hispanic"}
+demo["ethnicity"] = demo.ethnicity_concept_id.map(eth_map).fillna("Unknown")
+
+# Age at ICI
+demo = demo.merge(eligible[["person_id", "ici_index_date"]], on="person_id")
+demo["age_at_ici"] = demo.ici_index_date.dt.year - demo.year_of_birth
+
+
+def age_group(age):
+    if age < 45:
+        return "18-44"
+    if age < 55:
+        return "45-54"
+    if age < 65:
+        return "55-64"
+    if age < 75:
+        return "65-74"
+    return "75+"
+
+
+demo["age_group"] = demo.age_at_ici.apply(age_group)
+print(f"  Demographics: {len(demo):,}")
+for col in ["sex_at_birth", "race", "ethnicity", "age_group"]:
+    print(f"    {col}:")
+    for val, cnt in demo[col].value_counts().items():
+        print(f"      {val:30s} {cnt:>5,}  ({cnt/len(demo)*100:.1f}%)")
+
+save(
+    demo[
+        [
             "person_id",
-            "drug_concept_id",
-            "drug_exposure_start_date",
-            "drug_source_value",
-        ],
-    )
-    print(f"    drug_exposure: {len(drug):,}")
+            "sex_at_birth",
+            "race",
+            "ethnicity",
+            "age_group",
+            "age_at_ici",
+            "year_of_birth",
+        ]
+    ],
+    "02_demographics.csv",
+)
 
-    concept = pd.read_csv(
-        f"{DATA}/r6335_concept.csv",
-        encoding="cp1252",
-        low_memory=False,
-        usecols=["concept_id", "concept_name", "vocabulary_id", "concept_class_id"],
-    )
-    print(f"    concept: {len(concept):,}")
 
-    cond = pd.read_csv(
-        f"{DATA}/r6335_condition_occurrence.csv",
-        low_memory=False,
-        usecols=[
-            "person_id",
-            "condition_concept_id",
-            "condition_start_date",
-            "condition_source_value",
-        ],
-    )
-    print(f"    condition_occurrence: {len(cond):,}")
+# ═══════════════════════════════════════════════════════════════════
+# STEP 3: NCI CHARLSON COMORBIDITY INDEX (14 conditions)
+# ═══════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("STEP 3: NCI Charlson Comorbidity Index (v2 — corrected scoring)")
+print("=" * 70)
 
-    meas = pd.read_csv(f"{DATA}/r6335_measurement.csv", low_memory=False)
-    # Uppercase column names (INPC dump uses mixed case)
-    meas.columns = [c.lower() for c in meas.columns]
-    print(f"    measurement: {len(meas):,}")
+# Get all diagnoses for eligible patients
+dx_sql = f"""
+SELECT
+  co.person_id,
+  UPPER(REPLACE(c.concept_code, '.', '')) AS icd_code
+FROM `{CDR}.condition_occurrence` co
+JOIN `{CDR}.concept` c
+  ON c.concept_id = co.condition_source_concept_id
+WHERE c.vocabulary_id IN ('ICD9CM', 'ICD10CM')
+  AND co.person_id IN ({','.join(str(x) for x in eligible.person_id.tolist())})
+"""
+dx_all = q(dx_sql)
+print(f"  Diagnosis records: {len(dx_all):,}")
 
-    # ══════════════════════════════════════════════════════════════
-    # STEP 1: ICI COHORT
-    # ══════════════════════════════════════════════════════════════
-    print("\n" + "=" * 70)
-    print("STEP 1: ICI Cohort Identification")
-    print("=" * 70)
+# Build NCI-CCI flags using corrected module
+charlson = pd.DataFrame({"person_id": eligible.person_id.values})
+for condition in NCI_CCI_CONDITIONS:
+    charlson[condition] = 0
 
-    # Map drug_concept_id → concept_name
-    drug = drug.merge(
-        concept[["concept_id", "concept_name"]].rename(
-            columns={"concept_id": "drug_concept_id"}
-        ),
-        on="drug_concept_id",
-        how="left",
-    )
-    drug["ici_class"] = drug["concept_name"].apply(classify_ici)
-    # Also check source value
-    drug.loc[drug.ici_class.isna(), "ici_class"] = drug.loc[
-        drug.ici_class.isna(), "drug_source_value"
-    ].apply(classify_ici)
-
-    ici = drug[drug.ici_class.notna()].copy()
-    ici["drug_exposure_start_date"] = parse_date(ici["drug_exposure_start_date"])
-    print(f"  ICI exposures: {len(ici):,}")
-    print(f"  Unique ICI patients: {ici.person_id.nunique():,}")
-
-    # ICI index date = first ICI exposure
-    ici_index = (
-        ici.groupby("person_id")
-        .agg(
-            ici_index_date=("drug_exposure_start_date", "min"),
-            ici_classes=("ici_class", lambda x: set(x)),
+for condition, codes in NCI_CODESETS.items():
+    all_prefixes = []
+    for ver_codes in codes.values():
+        all_prefixes.extend(ver_codes)
+    mask = dx_all.icd_code.apply(
+        lambda x: (
+            any(str(x).startswith(p) for p in all_prefixes) if pd.notna(x) else False
         )
-        .reset_index()
     )
+    flagged = dx_all[mask].person_id.unique()
+    charlson.loc[charlson.person_id.isin(flagged), condition] = 1
 
-    # ICI regimen flags (graph nodes: 3 binary)
-    for cls in ["anti_pd1", "anti_pdl1", "anti_ctla4"]:
-        ici_index[f"ici_{cls.replace('anti_', '')}"] = ici_index["ici_classes"].apply(
-            lambda s: int(cls in s)
-        )
-    # anti_lag3 → fold into pd1 (almost always combination)
-    has_lag3 = ici_index.ici_classes.apply(lambda s: "anti_lag3" in s)
-    ici_index.loc[has_lag3, "ici_pd1"] = 1
+# Cast to int8
+for c in NCI_CCI_CONDITIONS:
+    charlson[c] = charlson[c].astype("int8")
 
-    print(f"  ICI regimen distribution:")
-    for cls in ["ici_pd1", "ici_pdl1", "ici_ctla4"]:
-        print(f"    {cls}: {ici_index[cls].sum():,}")
+# ── SCORING (v2 fix) ─────────────────────────────────────────────
+# CRITICAL: Do NOT zero out flags as pre-processing.
+# ❌ OLD (v1, WRONG):
+#   charlson.loc[charlson.Liver_Disease_Moderate_Severe==1, "Liver_Disease_Mild"] = 0
+#   charlson.loc[charlson.Diabetes_Complicated==1, "Diabetes"] = 0
+# ✅ NEW (v2, CORRECT): hierarchy handled inside scoring functions
 
-    # ── Cancer diagnosis confirmation ─────────────────────────────
-    cond["condition_source_value"] = cond["condition_source_value"].astype(str)
-    cancer_pts = cond[
-        cond.condition_source_value.apply(
-            lambda x: any(
-                str(x).upper().replace(".", "").startswith(p)
-                for p in CANCER_ICD10_PREFIXES
-            )
-        )
-    ].person_id.unique()
-    ici_index = ici_index[ici_index.person_id.isin(cancer_pts)].copy()
-    print(f"  ICI + cancer dx: {len(ici_index):,}")
+charlson["charlson_score"] = compute_charlson_score(charlson)
+charlson["nci_index"] = compute_nci_index(charlson)
 
-    # ── ESKD exclusion ────────────────────────────────────────────
-    eskd_pts = cond[
-        cond.condition_source_value.apply(
-            lambda x: prefix_match(x, ESKD_ICD9 + ESKD_ICD10)
-        )
-    ].person_id.unique()
-    n_eskd = ici_index.person_id.isin(eskd_pts).sum()
-    ici_index = ici_index[~ici_index.person_id.isin(eskd_pts)].copy()
-    print(f"  Excluded ESKD: {n_eskd:,}")
-    print(f"  After ESKD exclusion: {len(ici_index):,}")
+# ── BACKWARD COMPAT: keep old column name for R scripts ──────────
+# The R scripts reference 'nci_cci_score'. We use Charlson integer
+# score (same as before, but now correctly computed).
+charlson["nci_cci_score"] = charlson["charlson_score"]
 
-    # ══════════════════════════════════════════════════════════════
-    # STEP 2: SERUM CREATININE → AKI PHENOTYPING
-    # ══════════════════════════════════════════════════════════════
-    print("\n" + "=" * 70)
-    print("STEP 2: Creatinine → AKI Phenotyping")
-    print("=" * 70)
+# QC
+both_diab = (
+    (charlson["Diabetes"] == 1) & (charlson["Diabetes_Complicated"] == 1)
+).sum()
+both_mi = ((charlson["Acute_MI"] == 1) & (charlson["History_MI"] == 1)).sum()
+both_para_cvd = (
+    (charlson["Paralysis"] == 1) & (charlson["Cerebrovascular_Disease"] == 1)
+).sum()
+print(f"  QC: {both_diab} pts w/ both diabetes flags (raw, NOT zeroed)")
+print(f"  QC: {both_mi} pts w/ both MI types → Charlson MI = 1pt (OR, not 2)")
+print(f"  QC: {both_para_cvd} pts w/ paralysis+CVD → both score independently")
+print(
+    f"  Charlson score: median {charlson.charlson_score.median():.0f}, "
+    f"IQR {charlson.charlson_score.quantile(0.25):.0f}–"
+    f"{charlson.charlson_score.quantile(0.75):.0f}, "
+    f"max {charlson.charlson_score.max():.0f}"
+)
+print(
+    f"  NCI index: median {charlson.nci_index.median():.3f}, "
+    f"max {charlson.nci_index.max():.3f}"
+)
 
-    # Find creatinine measurements
-    cr_concepts = concept[
-        concept.concept_name.str.contains("creatinine", case=False, na=False)
-        & concept.concept_name.str.contains("serum|blood|plasma", case=False, na=False)
-    ].concept_id.tolist()
+for c in NCI_CCI_CONDITIONS:
+    print(f"    {c:40s} {charlson[c].sum():>6,}  ({charlson[c].mean()*100:.1f}%)")
 
-    # Also try by LOINC 2160-0 if available
-    loinc_cr = concept[
-        (concept.vocabulary_id == "LOINC")
-        & (concept.concept_name.str.contains("Creatinine", case=False, na=False))
-    ].concept_id.tolist()
-    cr_concepts = list(set(cr_concepts + loinc_cr))
+save(charlson, "03_nci_charlson.csv")
 
-    cr = meas[meas.measurement_concept_id.isin(cr_concepts)].copy()
-    cr = cr[cr.person_id.isin(ici_index.person_id)].copy()
-    cr["measurement_date"] = parse_date(cr["measurement_date"])
-    cr["value_as_number"] = pd.to_numeric(cr["value_as_number"], errors="coerce")
-    cr = cr.dropna(subset=["value_as_number", "measurement_date"])
-    cr = cr[(cr.value_as_number > 0.1) & (cr.value_as_number < 30)]
-    print(f"  Creatinine measurements: {len(cr):,}")
-    print(f"  Patients with Cr: {cr.person_id.nunique():,}")
 
-    # Merge with ICI index date
-    cr = cr.merge(ici_index[["person_id", "ici_index_date"]], on="person_id")
-    cr["days_from_index"] = (cr.measurement_date - cr.ici_index_date).dt.days
+# ═══════════════════════════════════════════════════════════════════
+# STEP 4: SDoH (Basics Survey)
+# ═══════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("STEP 4: SDoH (Basics Survey)")
+print("=" * 70)
 
-    # Baseline Cr: median outpatient in [-365d, -7d]
-    baseline = cr[(cr.days_from_index >= -365) & (cr.days_from_index <= -7)]
-    baseline_cr = (
-        baseline.groupby("person_id")["value_as_number"].median().rename("baseline_cr")
+# SDoH concept IDs (CDR C2024Q3R9)
+SDOH_CONCEPTS = {
+    "insurance_type": 43528428,
+    "income": 1585375,
+    "education": 1585940,
+    "employment": 1585952,
+    "housing": 1585370,
+    "housing_stability": 1585886,
+}
+
+sdoh_concept_ids = list(SDOH_CONCEPTS.values())
+sdoh_sql = f"""
+SELECT
+  o.person_id,
+  o.observation_source_concept_id,
+  o.value_source_concept_id,
+  vc.concept_name AS value_name
+FROM `{CDR}.observation` o
+LEFT JOIN `{CDR}.concept` vc ON vc.concept_id = o.value_source_concept_id
+WHERE o.observation_source_concept_id IN ({','.join(str(x) for x in sdoh_concept_ids)})
+  AND o.person_id IN ({','.join(str(x) for x in eligible.person_id.tolist())})
+"""
+sdoh_raw = q(sdoh_sql)
+print(f"  SDoH observations: {len(sdoh_raw):,}")
+
+# ── Insurance ─────────────────────────────────────────────────────
+ins = sdoh_raw[sdoh_raw.observation_source_concept_id == 43528428].copy()
+
+
+def classify_insurance(name):
+    if pd.isna(name):
+        return "Unknown"
+    n = str(name).lower()
+    if "medicaid" in n:
+        return "Medicaid"
+    if "medicare" in n:
+        return "Medicare"
+    if "employer" in n or "union" in n or "private" in n:
+        return "Private"
+    if "purchased" in n or "exchange" in n or "marketplace" in n:
+        return "Private"
+    if "military" in n or "va " in n or "tricare" in n or "champva" in n:
+        return "VA_Military"
+    if "indian" in n or "ihs" in n:
+        return "IHS"
+    if "no" in n or "uninsured" in n or "none" in n:
+        return "Uninsured"
+    return "Other"
+
+
+ins["insurance_type"] = ins.value_name.apply(classify_insurance)
+ins_final = ins.groupby("person_id").insurance_type.first().reset_index()
+
+# ── Income ────────────────────────────────────────────────────────
+inc = sdoh_raw[sdoh_raw.observation_source_concept_id == 1585375].copy()
+
+
+def classify_income(name):
+    # CDR C2024Q3R9 values: "Annual Income: less 10k", "Annual Income: 10k 25k", etc.
+    if pd.isna(name):
+        return "Unknown"
+    n = str(name).lower()
+    if "less 10k" in n:
+        return "lt10k"
+    if "10k 25k" in n:
+        return "10k_25k"
+    if "25k 35k" in n or "35k 50k" in n:
+        return "25k_50k"
+    if "50k 75k" in n:
+        return "50k_75k"
+    if "75k 100k" in n:
+        return "75k_100k"
+    if "100k 150k" in n or "150k 200k" in n or "more 200k" in n:
+        return "gt100k"
+    if "skip" in n or "prefer not" in n:
+        return "Unknown"
+    return "Unknown"
+
+
+inc["income"] = inc.value_name.apply(classify_income)
+inc_final = inc.groupby("person_id").income.first().reset_index()
+
+# ── Education ─────────────────────────────────────────────────────
+edu = sdoh_raw[sdoh_raw.observation_source_concept_id == 1585940].copy()
+
+
+def classify_education(name):
+    # CDR C2024Q3R9: "Highest Grade: Never Attended", "One Through Four",
+    # "Five Through Eight", "Nine Through Eleven", "Twelve Or GED",
+    # "College One to Three", "College Graduate", "Advanced Degree"
+    if pd.isna(name):
+        return "Unknown"
+    n = str(name).lower()
+    if (
+        "never" in n
+        or "one through four" in n
+        or "five through eight" in n
+        or "nine through eleven" in n
+    ):
+        return "lt_HS"
+    if "twelve" in n or "ged" in n:
+        return "HS_GED"
+    if "college one" in n or "one to three" in n:
+        return "Some_College"
+    if "college graduate" in n:
+        return "College"
+    if "advanced" in n:
+        return "Graduate"
+    if "skip" in n or "prefer not" in n:
+        return "Unknown"
+    return "Unknown"
+
+
+edu["education"] = edu.value_name.apply(classify_education)
+edu_final = edu.groupby("person_id").education.first().reset_index()
+
+# ── Employment ────────────────────────────────────────────────────
+emp = sdoh_raw[sdoh_raw.observation_source_concept_id == 1585952].copy()
+
+
+def classify_employment(name):
+    if pd.isna(name):
+        return "Unknown"
+    n = str(name).lower()
+    if "employed" in n and "not" not in n and "self" not in n:
+        return "Employed"
+    if "self" in n:
+        return "Self_Employed"
+    if "unemployed" in n or "out of work" in n or "looking" in n:
+        return "Unemployed"
+    if "retired" in n:
+        return "Retired"
+    if "unable" in n or "disabled" in n or "disability" in n:
+        return "Unable_to_Work"
+    if "student" in n:
+        return "Student"
+    if "homemaker" in n:
+        return "Homemaker"
+    if "skip" in n or "prefer not" in n:
+        return "Unknown"
+    return "Other"
+
+
+emp["employment"] = emp.value_name.apply(classify_employment)
+emp_final = emp.groupby("person_id").employment.first().reset_index()
+
+# ── Housing ───────────────────────────────────────────────────────
+hou = sdoh_raw[sdoh_raw.observation_source_concept_id == 1585370].copy()
+
+
+def classify_housing(name):
+    # CDR C2024Q3R9: "Current Home Own: Own", "Current Home Own: Rent",
+    # "Current Home Own: Other Arrangement"
+    # BUG FIX: "rent" is substring of "cuRRENT" and "own" is in prefix.
+    # Must match the value AFTER the colon.
+    if pd.isna(name):
+        return "Unknown"
+    n = str(name).lower()
+    if ": rent" in n:
+        return "Rent"
+    if ": other" in n or "arrangement" in n:
+        return "Other_Arrangement"
+    if ": own" in n:
+        return "Own"
+    if "skip" in n or "prefer not" in n or "dont know" in n:
+        return "Unknown"
+    return "Unknown"
+
+
+hou["housing"] = hou.value_name.apply(classify_housing)
+hou_final = hou.groupby("person_id").housing.first().reset_index()
+
+# ── Housing stability ─────────────────────────────────────────────
+stab = sdoh_raw[sdoh_raw.observation_source_concept_id == 1585886].copy()
+
+
+def classify_stability(name):
+    # CDR C2024Q3R9: "Stable House Concern: No", "Stable House Concern: Yes"
+    if pd.isna(name):
+        return "Unknown"
+    n = str(name).lower()
+    if "concern: no" in n:
+        return "Stable"
+    if "concern: yes" in n:
+        return "Unstable"
+    if "skip" in n or "prefer not" in n:
+        return "Unknown"
+    return "Unknown"
+
+
+stab["housing_stability"] = stab.value_name.apply(classify_stability)
+stab_final = stab.groupby("person_id").housing_stability.first().reset_index()
+
+# Assemble SDoH
+sdoh = pd.DataFrame({"person_id": eligible.person_id.values})
+for df_merge, col in [
+    (ins_final, "insurance_type"),
+    (inc_final, "income"),
+    (edu_final, "education"),
+    (emp_final, "employment"),
+    (hou_final, "housing"),
+    (stab_final, "housing_stability"),
+]:
+    sdoh = sdoh.merge(df_merge[["person_id", col]], on="person_id", how="left")
+
+# Fill missing
+for col in SDOH_CONCEPTS.keys():
+    sdoh[col] = sdoh[col].astype(object).fillna("Unknown")
+
+print(f"  SDoH assembled: {len(sdoh):,}")
+for col in SDOH_CONCEPTS.keys():
+    non_unk = (sdoh[col] != "Unknown").sum()
+    print(f"    {col:25s} known: {non_unk:>5,} ({non_unk/len(sdoh)*100:.1f}%)")
+
+save(sdoh, "04_sdoh.csv")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 5: CANCER TYPE + ICI CLASS + NEPHROTOXINS
+# ═══════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("STEP 5: Cancer Type + ICI Class + Nephrotoxins")
+print("=" * 70)
+
+# ── Cancer type ───────────────────────────────────────────────────
+cancer_dx_sql = f"""
+SELECT
+  co.person_id,
+  c.concept_code,
+  co.condition_start_date
+FROM `{CDR}.condition_occurrence` co
+JOIN `{CDR}.concept` c ON c.concept_id = co.condition_source_concept_id
+WHERE c.vocabulary_id = 'ICD10CM'
+  AND c.concept_code LIKE 'C%'
+  AND co.person_id IN ({','.join(str(x) for x in eligible.person_id.tolist())})
+"""
+cancer_dx = q(cancer_dx_sql)
+
+
+def classify_cancer(code):
+    if pd.isna(code):
+        return "Other_Solid"
+    code = str(code).upper().replace(".", "")
+    if code.startswith("C34"):
+        return "Lung"
+    if code.startswith("C43"):
+        return "Melanoma"
+    if code.startswith("C64") or code.startswith("C65"):
+        return "Renal_Cell"
+    if code.startswith("C67"):
+        return "Urothelial"
+    if code.startswith("C50"):
+        return "Breast"
+    if (
+        code.startswith("C10")
+        or code.startswith("C11")
+        or code.startswith("C12")
+        or code.startswith("C13")
+        or code.startswith("C14")
+        or code.startswith("C32")
+    ):
+        return "Head_Neck"
+    if code.startswith("C22"):
+        return "Hepatocellular"
+    if code.startswith("C18") or code.startswith("C19") or code.startswith("C20"):
+        return "Colorectal"
+    if (
+        code.startswith("C81")
+        or code.startswith("C82")
+        or code.startswith("C83")
+        or code.startswith("C84")
+        or code.startswith("C85")
+        or code.startswith("C91")
+        or code.startswith("C92")
+    ):
+        return "Hematologic"
+    return "Other_Solid"
+
+
+cancer_dx["cancer_type"] = cancer_dx.concept_code.apply(classify_cancer)
+cancer_primary = (
+    cancer_dx.groupby("person_id")
+    .cancer_type.agg(lambda x: x.value_counts().index[0])
+    .reset_index()
+)
+
+
+# ── ICI regimen classification ────────────────────────────────────
+def classify_ici(drugs_list):
+    if not isinstance(drugs_list, (list, np.ndarray)):
+        return "unknown"
+    drugs_str = " ".join([str(d).lower() for d in drugs_list])
+    has_pd1 = any(
+        a in drugs_str
+        for a in ["nivolumab", "pembrolizumab", "cemiplimab", "dostarlimab"]
     )
+    has_pdl1 = any(a in drugs_str for a in ["atezolizumab", "durvalumab", "avelumab"])
+    has_ctla4 = any(a in drugs_str for a in ["ipilimumab", "tremelimumab"])
+    if has_ctla4 and (has_pd1 or has_pdl1):
+        return "combo_pd1_ctla4"
+    if has_pd1:
+        return "anti_pd1"
+    if has_pdl1:
+        return "anti_pdl1"
+    if has_ctla4:
+        return "anti_ctla4"
+    return "other_ici"
 
-    # Follow-up Cr: [1d, 365d]
-    followup = cr[(cr.days_from_index >= 1) & (cr.days_from_index <= 365)]
 
-    # Compute max Cr ratio per window
-    cohort = ici_index.merge(baseline_cr, on="person_id", how="inner")
-    n_no_baseline = len(ici_index) - len(cohort)
-    print(f"  Excluded (no baseline Cr): {n_no_baseline:,}")
+ici_regimen = ici_cancer_basics[["person_id", "ici_drugs"]].copy()
+ici_regimen["ici_regimen"] = ici_regimen.ici_drugs.apply(classify_ici)
 
-    # For each window, find max Cr ratio
-    followup_with_base = followup.merge(
-        cohort[["person_id", "baseline_cr", "ici_index_date"]],
-        on="person_id",
-    )
-    followup_with_base["cr_ratio"] = (
-        followup_with_base.value_as_number / followup_with_base.baseline_cr
-    )
+# Merge cancer + ICI
+covariates = eligible[["person_id"]].merge(cancer_primary, on="person_id", how="left")
+covariates = covariates.merge(
+    ici_regimen[["person_id", "ici_regimen"]], on="person_id", how="left"
+)
+covariates.cancer_type = covariates.cancer_type.fillna("Unknown")
+covariates.ici_regimen = covariates.ici_regimen.fillna("unknown")
 
-    for label, max_days in AKI_WINDOWS.items():
-        window = followup_with_base[followup_with_base.days_from_index <= max_days]
-        max_ratio = (
-            window.groupby("person_id")["cr_ratio"]
-            .max()
-            .rename(f"max_cr_ratio_{label}")
-        )
-        cohort = cohort.merge(max_ratio, on="person_id", how="left")
-        cohort[label] = (cohort[f"max_cr_ratio_{label}"] >= CR_RATIO_THRESHOLD).astype(
-            int
-        )
-        cohort.loc[cohort[f"max_cr_ratio_{label}"].isna(), label] = np.nan
+# ── Nephrotoxin flags ─────────────────────────────────────────────
+NEPHROTOXIN_CLASSES = {
+    "ppi": [
+        "omeprazole",
+        "pantoprazole",
+        "lansoprazole",
+        "esomeprazole",
+        "rabeprazole",
+        "dexlansoprazole",
+    ],
+    "nsaid": [
+        "ibuprofen",
+        "naproxen",
+        "diclofenac",
+        "meloxicam",
+        "celecoxib",
+        "indomethacin",
+        "ketorolac",
+        "piroxicam",
+    ],
+    "acei_arb": [
+        "lisinopril",
+        "enalapril",
+        "ramipril",
+        "benazepril",
+        "captopril",
+        "losartan",
+        "valsartan",
+        "irbesartan",
+        "olmesartan",
+        "candesartan",
+        "telmisartan",
+    ],
+    "diuretic": [
+        "furosemide",
+        "hydrochlorothiazide",
+        "chlorthalidone",
+        "bumetanide",
+        "torsemide",
+        "spironolactone",
+        "amiloride",
+    ],
+}
 
-    # Drop patients with no follow-up Cr at all
-    has_followup = followup.person_id.unique()
-    n_no_followup = (~cohort.person_id.isin(has_followup)).sum()
-    cohort = cohort[cohort.person_id.isin(has_followup)].copy()
-    print(f"  Excluded (no follow-up Cr): {n_no_followup:,}")
-
-    # Drop baseline Cr >= 4.0 (pre-existing severe CKD)
-    n_high_base = (cohort.baseline_cr >= 4.0).sum()
-    cohort = cohort[cohort.baseline_cr < 4.0].copy()
-    print(f"  Excluded (baseline Cr ≥ 4.0): {n_high_base:,}")
-
-    print(f"\n  Final cohort: {len(cohort):,}")
-    for label in AKI_WINDOWS:
-        valid = cohort[label].notna()
-        n_events = int(cohort.loc[valid, label].sum())
-        print(f"    {label}: {n_events:,} events " f"({n_events/valid.sum()*100:.1f}%)")
-
-    # ══════════════════════════════════════════════════════════════
-    # STEP 3: DEMOGRAPHICS
-    # ══════════════════════════════════════════════════════════════
-    print("\n" + "=" * 70)
-    print("STEP 3: Demographics")
-    print("=" * 70)
-
-    demo = person[person.person_id.isin(cohort.person_id)].copy()
-
-    # Age
-    cohort = cohort.merge(
-        demo[["person_id", "year_of_birth"]],
-        on="person_id",
-        how="left",
-    )
-    cohort["age"] = cohort.ici_index_date.dt.year - cohort.year_of_birth
-
-    # Sex (concept-based)
-    sex_map = {8507: "Male", 8532: "Female"}
-    demo["sex"] = demo.gender_concept_id.map(sex_map).fillna("Other")
-    cohort = cohort.merge(demo[["person_id", "sex"]], on="person_id", how="left")
-
-    # Race
-    race_map = {8527: "White", 8516: "Black", 8515: "Asian"}
-    demo["race"] = demo.race_concept_id.map(race_map).fillna("Other")
-    cohort = cohort.merge(demo[["person_id", "race"]], on="person_id", how="left")
-
-    # Ethnicity
-    eth_map = {38003563: "Hispanic", 38003564: "Not Hispanic"}
-    demo["ethnicity"] = demo.ethnicity_concept_id.map(eth_map).fillna("Other")
-    cohort = cohort.merge(
-        demo[["person_id", "ethnicity"]],
-        on="person_id",
-        how="left",
-    )
-
-    print(f"  Sex: {cohort.sex.value_counts().to_dict()}")
-    print(f"  Race: {cohort.race.value_counts().to_dict()}")
-    print(f"  Age: mean={cohort.age.mean():.1f}, " f"median={cohort.age.median():.0f}")
-
-    # ══════════════════════════════════════════════════════════════
-    # STEP 4: NCI-CCI COMORBIDITIES
-    # ══════════════════════════════════════════════════════════════
-    print("\n" + "=" * 70)
-    print("STEP 4: NCI-CCI (14 conditions)")
-    print("=" * 70)
-
-    cond_cohort = cond[cond.person_id.isin(cohort.person_id)].copy()
-    cond_cohort["code"] = (
-        cond_cohort.condition_source_value.astype(str)
-        .str.upper()
-        .str.replace(".", "", regex=False)
-    )
-
-    for condition, codes in NCI_CCI.items():
-        all_prefixes = codes.get("9", []) + codes.get("10", [])
-        mask = cond_cohort.code.apply(
-            lambda c: any(
-                c.startswith(p.upper().replace(".", "")) for p in all_prefixes
-            )
-        )
-        pts_with = set(cond_cohort.loc[mask, "person_id"])
-        cohort[condition] = cohort.person_id.isin(pts_with).astype(int)
-        prev = cohort[condition].mean()
-        print(f"    {condition:40s} {cohort[condition].sum():5,} " f"({prev*100:.1f}%)")
-
-    # NCI-CCI score
-    cohort["nci_cci_score"] = sum(
-        cohort[cond].astype(int) * wt
-        for cond, wt in NCI_WEIGHTS.items()
-        if cond in cohort.columns
-    )
-
-    # ══════════════════════════════════════════════════════════════
-    # STEP 5: NEPHROTOXIN FLAG
-    # ══════════════════════════════════════════════════════════════
-    print("\n" + "=" * 70)
-    print("STEP 5: Concomitant Nephrotoxins")
-    print("=" * 70)
-
-    drug_cohort = drug[drug.person_id.isin(cohort.person_id)].copy()
-    drug_cohort["drug_exposure_start_date"] = parse_date(
-        drug_cohort["drug_exposure_start_date"]
-    )
-    drug_cohort = drug_cohort.merge(
-        cohort[["person_id", "ici_index_date"]],
-        on="person_id",
-    )
-    # Concomitant = within [-30d, +30d] of ICI index
-    drug_cohort["days"] = (
-        drug_cohort.drug_exposure_start_date - drug_cohort.ici_index_date
-    ).dt.days
-    concomitant = drug_cohort[(drug_cohort.days >= -30) & (drug_cohort.days <= 30)]
-
-    def has_nephrotoxin(names):
-        if not isinstance(names, str):
-            return False
-        low = names.lower()
-        return any(kw in low for kw in NEPHROTOXIN_KEYWORDS)
-
-    nephro_check = concomitant.copy()
-    nephro_check["is_nephrotoxin"] = nephro_check["concept_name"].apply(
-        has_nephrotoxin
-    ) | nephro_check["drug_source_value"].apply(has_nephrotoxin)
-    nephro_pts = set(nephro_check[nephro_check.is_nephrotoxin].person_id)
-    cohort["nephrotoxin"] = cohort.person_id.isin(nephro_pts).astype(int)
+for drug_class, agents in NEPHROTOXIN_CLASSES.items():
+    agent_likes = " OR ".join([f"LOWER(c.concept_name) LIKE '%{a}%'" for a in agents])
+    neph_sql = f"""
+    SELECT DISTINCT de.person_id
+    FROM `{CDR}.drug_exposure` de
+    JOIN `{CDR}.concept` c ON c.concept_id = de.drug_concept_id
+    WHERE ({agent_likes})
+      AND de.person_id IN ({','.join(str(x) for x in eligible.person_id.tolist())})
+    """
+    neph_pts = q(neph_sql)
+    covariates[drug_class] = covariates.person_id.isin(neph_pts.person_id).astype(int)
     print(
-        f"  Nephrotoxin exposure: {cohort.nephrotoxin.sum():,} "
-        f"({cohort.nephrotoxin.mean()*100:.1f}%)"
+        f"  {drug_class}: {covariates[drug_class].sum():,} ({covariates[drug_class].mean()*100:.1f}%)"
     )
 
-    # ══════════════════════════════════════════════════════════════
-    # STEP 6: BUILD FEATURE MATRIX [F, N]
-    # ══════════════════════════════════════════════════════════════
-    print("\n" + "=" * 70)
-    print("STEP 6: Build Feature Matrix")
-    print("=" * 70)
+# Collapsed factors
+covariates["cancer_type_collapsed"] = covariates.cancer_type.apply(
+    lambda x: x if x in ["Lung", "Melanoma"] else "Other"
+)
+covariates["ici_collapsed"] = covariates.ici_regimen.apply(
+    lambda x: "anti_pd1" if x == "anti_pd1" else "other_combo"
+)
 
-    feature_names = []
-    feature_cols = []
-    is_binary = []
+print(f"  Cancer types: {covariates.cancer_type.value_counts().to_dict()}")
+print(f"  ICI regimens: {covariates.ici_regimen.value_counts().to_dict()}")
 
-    # Demographics (4 nodes)
-    # Age (standardized)
-    age_raw = cohort["age"].values.astype(np.float64)
-    age_std = ((age_raw - np.nanmean(age_raw)) / (np.nanstd(age_raw) + 1e-8)).astype(
-        np.float32
-    )
-    feature_names.append("age")
-    feature_cols.append(age_std)
-    is_binary.append(False)
-
-    # Sex (binary: male=1)
-    feature_names.append("sex_male")
-    feature_cols.append((cohort.sex == "Male").values.astype(np.float32))
-    is_binary.append(True)
-
-    # Race (binary: Black=1)
-    feature_names.append("race_black")
-    feature_cols.append((cohort.race == "Black").values.astype(np.float32))
-    is_binary.append(True)
-
-    # Ethnicity (binary: Hispanic=1)
-    feature_names.append("ethnicity_hispanic")
-    feature_cols.append((cohort.ethnicity == "Hispanic").values.astype(np.float32))
-    is_binary.append(True)
-
-    # NCI-CCI flags (drop low prevalence)
-    dropped = []
-    for condition in NCI_CCI:
-        prev = cohort[condition].mean()
-        if prev < MIN_PREVALENCE:
-            dropped.append((condition, prev))
-            continue
-        feature_names.append(condition)
-        feature_cols.append(cohort[condition].values.astype(np.float32))
-        is_binary.append(True)
-
-    if dropped:
-        print(
-            f"  Dropped {len(dropped)} NCI-CCI flags "
-            f"(prevalence < {MIN_PREVALENCE}):"
-        )
-        for c, p in dropped:
-            print(f"    {c}: {p*100:.2f}%")
-
-    # ICI class (3 binary nodes)
-    for cls in ["ici_pd1", "ici_pdl1", "ici_ctla4"]:
-        feature_names.append(cls)
-        feature_cols.append(cohort[cls].values.astype(np.float32))
-        is_binary.append(True)
-
-    # Nephrotoxin (1 binary node)
-    feature_names.append("nephrotoxin")
-    feature_cols.append(cohort["nephrotoxin"].values.astype(np.float32))
-    is_binary.append(True)
-
-    # NCI-CCI score (1 continuous node, standardized)
-    score_raw = cohort["nci_cci_score"].values.astype(np.float64)
-    score_std = (
-        (score_raw - np.nanmean(score_raw)) / (np.nanstd(score_raw) + 1e-8)
-    ).astype(np.float32)
-    feature_names.append("nci_cci_score")
-    feature_cols.append(score_std)
-    is_binary.append(False)
-
-    # AKI outcome node (using primary window)
-    feature_names.append("aki_event")
-    aki_col = cohort[PRIMARY_WINDOW].fillna(0).values.astype(np.float32)
-    feature_cols.append(aki_col)
-    is_binary.append(True)
-
-    # Assemble
-    X = np.stack(feature_cols, axis=0)  # [F, N]
-    X = np.nan_to_num(X, nan=0.0)
-    feature_matrix = torch.tensor(X, dtype=torch.float32)
-    binary_mask = torch.tensor(is_binary, dtype=torch.bool)
-
-    F_nodes, N = feature_matrix.shape
-    aki_idx = feature_names.index("aki_event")
-
-    print(f"\n  Feature matrix: [{F_nodes}, {N}]")
-    print(
-        f"  Nodes: {F_nodes} "
-        f"({sum(is_binary)} binary, {F_nodes - sum(is_binary)} continuous)"
-    )
-    print(f"  AKI node index: {aki_idx}")
-
-    for i, (name, b) in enumerate(zip(feature_names, is_binary)):
-        tag = "bin" if b else "con"
-        vals = feature_cols[i]
-        if b:
-            print(f"    [{i:2d}] {name:40s} ({tag})  " f"prev={vals.mean():.3f}")
-        else:
-            print(
-                f"    [{i:2d}] {name:40s} ({tag})  "
-                f"mean={vals.mean():.3f} std={vals.std():.3f}"
-            )
-
-    # ── Save ──────────────────────────────────────────────────────
-    torch.save(feature_matrix, os.path.join(OUT, "feature_matrix.pt"))
-    torch.save(binary_mask, os.path.join(OUT, "binary_mask.pt"))
-    with open(os.path.join(OUT, "feature_names.json"), "w") as f:
-        json.dump(feature_names, f, indent=2)
-
-    # Cohort metadata
-    meta_cols = ["person_id"] + list(AKI_WINDOWS.keys())
-    meta = cohort[meta_cols].copy()
-    meta.to_csv(os.path.join(OUT, "cohort_meta.csv"), index=False)
-
-    print(f"\n  Saved to {OUT}/:")
-    print(f"    feature_matrix.pt   {list(feature_matrix.shape)}")
-    print(f"    feature_names.json  {F_nodes} names")
-    print(f"    binary_mask.pt      {list(binary_mask.shape)}")
-    print(f"    cohort_meta.csv     {len(meta):,} rows")
-    print()
-    print("  Next: scp -r data/ tempest:~/graphai_ici_aki/data/")
-    print("=" * 70)
+save(covariates, "05_covariates.csv")
 
 
-if __name__ == "__main__":
-    main()
+# ═══════════════════════════════════════════════════════════════════
+# STEP 6: MATCHING VARIABLES
+# ═══════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("STEP 6: Matching Variables")
+print("=" * 70)
+
+match_dx_sql = f"""
+SELECT
+  person_id,
+  COUNT(DISTINCT condition_concept_id) AS n_diagnoses,
+  MIN(condition_start_date) AS first_dx,
+  MAX(condition_start_date) AS last_dx
+FROM `{CDR}.condition_occurrence`
+WHERE person_id IN ({','.join(str(x) for x in eligible.person_id.tolist())})
+GROUP BY person_id
+"""
+match_vars = q(match_dx_sql)
+match_vars["first_dx"] = parse_date(match_vars["first_dx"])
+match_vars["last_dx"] = parse_date(match_vars["last_dx"])
+match_vars["ehr_length_days"] = (match_vars.last_dx - match_vars.first_dx).dt.days
+ref_date = match_vars.first_dx.min()
+match_vars["enrollment_days"] = (match_vars.first_dx - ref_date).dt.days
+
+print(f"  Matching vars: {len(match_vars):,}")
+save(
+    match_vars[["person_id", "n_diagnoses", "ehr_length_days", "enrollment_days"]],
+    "06_matching_variables.csv",
+)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 7: REGRESSION BASE ASSEMBLY
+# ═══════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("STEP 7: Regression Base Assembly")
+print("=" * 70)
+
+reg = eligible[
+    [
+        "person_id",
+        "severity",
+        "ici_index_date",
+        "baseline_cr",
+        "max_cr_ratio",
+        "max_delta_cr",
+        "aki_delta03",
+        "aki_kdigo2",
+        "aki_kdigo3",
+        "aki_180d",
+    ]
+].copy()
+reg = reg.merge(
+    demo[["person_id", "sex_at_birth", "race", "ethnicity", "age_group"]],
+    on="person_id",
+)
+reg = reg.merge(charlson, on="person_id")
+reg = reg.merge(covariates, on="person_id")
+reg = reg.merge(sdoh, on="person_id")
+reg = reg.merge(
+    match_vars[["person_id", "enrollment_days", "n_diagnoses", "ehr_length_days"]],
+    on="person_id",
+)
+
+print(f"  Regression base: {len(reg):,} rows, {reg.shape[1]} cols")
+print(f"  Cases: {reg.severity.sum():,}  Controls: {(reg.severity==0).sum():,}")
+print(
+    f"  Charlson score: median {reg.charlson_score.median():.0f}, "
+    f"IQR {reg.charlson_score.quantile(0.25):.0f}–{reg.charlson_score.quantile(0.75):.0f}"
+)
+print(f"  NCI index: median {reg.nci_index.median():.3f}")
+
+save(reg, "07_pre_matching_base.csv")
+
+
+# ═══════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("AoU ETL COMPLETE (v2 — NCI-CCI scoring fix)")
+print("=" * 70)
+print(f"  Output: {RESULTS}/")
+print(f"  Next:   Rscript 01b_psm.R ici_aki")
+print(f"          Rscript 02_models.R ici_aki")
+print(f"\n  NCI-CCI FIX SUMMARY:")
+print(f"    ✅ MI scoring: OR logic (max 1pt)")
+print(f"    ✅ Paralysis/CVD: independent scoring")
+print(f"    ✅ No hierarchy pre-processing (raw flags preserved)")
+print(f"    ✅ Both Charlson (integer) and NCI Index (continuous) computed")
