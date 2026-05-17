@@ -55,22 +55,28 @@ def compute_loss(x, x_recon, aki_idx, y_aki, train_idx, lam=1.0, binary_mask=Non
     Returns:
         total_loss, recon_loss, ce_loss
     """
-    # Reconstruction loss — ALL patients (semi-supervised signal)
+    # Reconstruction loss — ALL features EXCEPT AKI row
+    # (AKI row is masked for test patients, so reconstruction would
+    #  train toward 0. AKI prediction comes from CE loss only.)
+    recon_mask = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
+    recon_mask[aki_idx] = False
+
     if binary_mask is not None:
-        cont = ~binary_mask
+        cont = (~binary_mask) & recon_mask
+        bbin = binary_mask & recon_mask
         n_cont = cont.sum().item()
-        n_bin = binary_mask.sum().item()
+        n_bin = bbin.sum().item()
 
         loss_parts = []
         if n_cont > 0:
             loss_parts.append(F.mse_loss(x_recon[cont], x[cont]))
         if n_bin > 0:
             loss_parts.append(
-                F.binary_cross_entropy_with_logits(x_recon[binary_mask], x[binary_mask])
+                F.binary_cross_entropy_with_logits(x_recon[bbin], x[bbin])
             )
         recon_loss = sum(loss_parts) / max(len(loss_parts), 1)
     else:
-        recon_loss = F.mse_loss(x_recon, x)
+        recon_loss = F.mse_loss(x_recon[recon_mask], x[recon_mask])
 
     # CE loss on AKI node — TRAINING patients only
     aki_logits = x_recon[aki_idx]  # [N]
@@ -133,6 +139,11 @@ def train_one_fold(
         optimizer, T_max=config["epochs"]
     )
 
+    # ── Mask test AKI labels to prevent leakage ──
+    # The model must INFER test AKI values from other features via the graph.
+    x_masked = x_full.clone()
+    x_masked[aki_idx, test_idx] = 0.0  # hide test AKI from input
+
     best_auroc = 0.0
     best_metrics = {}
     patience_counter = 0
@@ -140,10 +151,10 @@ def train_one_fold(
 
     for epoch in range(config["epochs"]):
         model.train()
-        x_recon, z = model(x_full, edge_index)
+        x_recon, z = model(x_masked, edge_index)
 
         loss, recon_l, ce_l = compute_loss(
-            x_full,
+            x_masked,
             x_recon,
             aki_idx,
             y_all,
@@ -162,7 +173,7 @@ def train_one_fold(
 
         # Evaluate periodically
         if epoch % config.get("eval_every", 10) == 0:
-            metrics = evaluate(model, x_full, edge_index, aki_idx, y_all, test_idx)
+            metrics = evaluate(model, x_masked, edge_index, aki_idx, y_all, test_idx)
 
             if wandb_run is not None:
                 wandb_run.log(
