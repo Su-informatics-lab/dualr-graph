@@ -662,25 +662,6 @@ ESKD_PREFIXES = [
 def resolve_cols(csv_path, wanted, encoding=None):
     header = pd.read_csv(csv_path, nrows=0, encoding=encoding).columns.tolist()
     lower_map = {c.lower(): c for c in header}
-    return (
-        [lower_map[w.lower()] for w in wanted if w.lower() in lower_map]
-        if encoding
-        else [
-            lower_map.get(w.lower())
-            or (
-                _
-                for _ in [None]
-                if (_ := lower_map.get(w.lower())) is None and (_ := w)
-            ).__next__()
-            for w in wanted
-        ]
-    )
-
-
-# Fix resolve_cols to raise on missing
-def resolve_cols(csv_path, wanted, encoding=None):
-    header = pd.read_csv(csv_path, nrows=0, encoding=encoding).columns.tolist()
-    lower_map = {c.lower(): c for c in header}
     resolved = []
     for w in wanted:
         actual = lower_map.get(w.lower())
