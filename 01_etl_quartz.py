@@ -61,7 +61,8 @@ os.makedirs(FIG, exist_ok=True)
 
 CHUNK = 500_000  # rows per chunk for large csvs
 MIN_PREVALENCE = 0.01
-CR_RATIO_THRESHOLD = 2.0  # Cr ≥ 2.0× baseline
+# CR_RATIO_THRESHOLD = 2.0  # Cr ≥ 2.0× baseline
+CR_RATIO_THRESHOLD = 1.5  # any AKI (KDIGO stage 1+)
 
 AKI_WINDOWS = {"aki_3m": 90, "aki_6m": 180, "aki_12m": 365}
 PRIMARY_WINDOW = "aki_12m"
@@ -1151,13 +1152,59 @@ def main():
         print("  No AKI ICD records found")
 
     if len(aki_icd) > 0:
-        # Parse dates, filter to post-ICI [+1d, +365d]
+        # Parse dates first (needed for both filters)
         aki_icd["condition_date"] = parse_date(aki_icd.condition_start_date)
         aki_icd = aki_icd.merge(cohort[["person_id", "ici_index_date"]], on="person_id")
         aki_icd["days"] = (aki_icd.condition_date - aki_icd.ici_index_date).dt.days
+
+        # ── Filter A: severe visit ────────────────────────────
+        if os.path.exists(visit_path):
+            print("  Reading visit_occurrence for severe visit filter...")
+            visit_cols = resolve_cols(
+                visit_path,
+                ["visit_occurrence_id", "person_id", "visit_concept_id"],
+            )
+            severe_visit_ids = set()
+            for chunk in pd.read_csv(
+                visit_path,
+                low_memory=False,
+                chunksize=CHUNK,
+                usecols=visit_cols,
+            ):
+                chunk.columns = [c.lower() for c in chunk.columns]
+                chunk = normalize_pid_column(chunk, "person_id")
+                chunk = chunk[
+                    chunk.person_id.isin(cohort_pids)
+                    & chunk.visit_concept_id.isin(SEVERE_VISIT_CONCEPTS)
+                ]
+                if not chunk.empty:
+                    severe_visit_ids.update(chunk.visit_occurrence_id)
+            print(f"  Severe visit IDs (cohort): {len(severe_visit_ids):,}")
+
+            aki_icd["visit_occurrence_id"] = pd.to_numeric(
+                aki_icd["visit_occurrence_id"], errors="coerce"
+            )
+            is_severe = aki_icd.visit_occurrence_id.isin(severe_visit_ids)
+        else:
+            print("  ⚠ visit_occurrence not found — severe filter skipped")
+            is_severe = pd.Series(True, index=aki_icd.index)
+
+        # ── Filter B: incident AKI (no AKI ICD in [-90d, 0d]) ─
+        pre_index_aki = aki_icd[(aki_icd.days >= -90) & (aki_icd.days <= 0)]
+        pts_with_preindex_aki = set(pre_index_aki.person_id)
+        is_incident = ~aki_icd.person_id.isin(pts_with_preindex_aki)
+        print(
+            f"  Patients with pre-index AKI ICD (90d): {len(pts_with_preindex_aki):,}"
+        )
+
+        # ── Accept if EITHER severe visit OR incident ──────────
+        aki_icd = aki_icd[is_severe | is_incident].copy()
+        print(f"  AKI ICD after filter (severe OR incident): {len(aki_icd):,}")
+
+        # Post-ICI window [+1d, +365d]
         aki_icd = aki_icd[(aki_icd.days >= 1) & (aki_icd.days <= 365)]
 
-        # Earliest ICD event per patient
+        # Earliest per patient
         icd_first_evt = (
             aki_icd.sort_values("condition_date")
             .groupby("person_id")
@@ -1168,7 +1215,7 @@ def main():
     else:
         icd_first_evt = pd.DataFrame(columns=["person_id", "icd_evt_date"])
 
-    print(f"  ICD-based AKI events (post-ICI, severe): {len(icd_first_evt):,}")
+    print(f"  ICD-based AKI events (post-ICI): {len(icd_first_evt):,}")
 
     del aki_icd
     gc.collect()
