@@ -517,14 +517,9 @@ def code_matches(code_str, prefixes):
     return any(c.startswith(p.upper().replace(".", "")) for p in prefixes)
 
 
-def resolve_cols(csv_path, wanted):
-    """Peek at CSV header, return usecols list in the file's actual case.
-
-    wanted: list of column names in any case (e.g. ["person_id", "PERSON_ID"])
-    Returns: list of column names as they appear in the file header.
-    Raises ValueError if any wanted column is missing (case-insensitive).
-    """
-    header = pd.read_csv(csv_path, nrows=0).columns.tolist()
+def resolve_cols(csv_path, wanted, encoding=None):
+    """Peek at CSV header, return usecols list in the file's actual case."""
+    header = pd.read_csv(csv_path, nrows=0, encoding=encoding).columns.tolist()
     lower_map = {c.lower(): c for c in header}
     resolved = []
     for w in wanted:
@@ -647,23 +642,28 @@ def main():
         if chunk.empty:
             continue
 
+        # INPC format: "1284^^H35.341" → extract ICD after "^^"
+        raw = chunk.condition_source_value.astype(str)
         chunk["code"] = (
-            chunk.condition_source_value.astype(str)
+            raw.str.split("^^")
+            .str[-1]  # take part after ^^
             .str.upper()
             .str.replace(".", "", regex=False)
         )
 
-        for _, row in chunk.iterrows():
-            pid = row.person_id
-            code = row.code
+        # Vectorized cancer check (ICD-10 C-codes)
+        is_cancer = chunk.code.apply(
+            lambda c: any(c.startswith(p) for p in CANCER_PREFIXES_10)
+        )
+        cancer_pids.update(chunk.loc[is_cancer, "person_id"])
 
-            # Cancer check
-            if any(code.startswith(p) for p in CANCER_PREFIXES_10):
-                cancer_pids.add(pid)
-            # ESKD check
-            if any(code.startswith(p.upper().replace(".", "")) for p in ESKD_PREFIXES):
-                eskd_pids.add(pid)
-            # Store codes for NCI-CCI
+        # Vectorized ESKD check
+        eskd_norm = [p.upper().replace(".", "") for p in ESKD_PREFIXES]
+        is_eskd = chunk.code.apply(lambda c: any(c.startswith(p) for p in eskd_norm))
+        eskd_pids.update(chunk.loc[is_eskd, "person_id"])
+
+        # Store codes for NCI-CCI (step 4) — only ICI patients
+        for pid, code in zip(chunk.person_id, chunk.code):
             if pid not in patient_codes:
                 patient_codes[pid] = set()
             patient_codes[pid].add(code)
@@ -688,7 +688,7 @@ def main():
     # Find creatinine concept IDs from concept table (small filtered read)
     concept_path = f"{DATA}/r6335_concept.csv"
     concept_cols = resolve_cols(
-        concept_path, ["concept_id", "concept_name", "vocabulary_id"]
+        concept_path, ["concept_id", "concept_name", "vocabulary_id"], encoding="cp1252"
     )
     concept_cr = pd.read_csv(
         concept_path,
