@@ -643,7 +643,7 @@ NCI_WEIGHTS = {
     "Rheumatic_Disease": 1,
     "AIDS": 6,
 }
-CANCER_PREFIXES_10 = ["C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "D0"]
+CANCER_PREFIXES_10 = ["C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9"]
 ESKD_PREFIXES = [
     "5856",
     "N186",
@@ -1009,7 +1009,18 @@ def main():
     cohort = cohort.merge(last_obs, on="person_id", how="left")
     has_fu = set(int(p) for p in cr[(cr.days >= 1) & (cr.days <= 365)].person_id)
     cohort = cohort[cohort.person_id.isin(has_fu) & (cohort.baseline_cr < 4.0)].copy()
-    print(f"  Final cohort: {len(cohort):,}")
+    print(f"  Cohort after Cr filters: {len(cohort):,}")
+
+    # Washout: flag patients with Cr-based AKI in 90 days before ICI
+    pre_ici_cr = cr[(cr.days >= -90) & (cr.days <= 0)].copy()
+    pre_ici_cr = pre_ici_cr.merge(cohort[["person_id", "baseline_cr"]], on="person_id")
+    pre_ici_cr["ratio"] = pre_ici_cr.value_as_number / pre_ici_cr.baseline_cr
+    washout_cr_pids = set(
+        int(p) for p in pre_ici_cr[pre_ici_cr.ratio >= CR_RATIO_THRESHOLD].person_id
+    )
+    print(
+        f"  Washout (Cr ≥{CR_RATIO_THRESHOLD}× in 90d pre-ICI): {len(washout_cr_pids)}"
+    )
 
     # ── Baseline labs (BUN, Hgb, Alb, K) ──────────────────────
     cohort_pids_set = set(int(p) for p in cohort.person_id)
@@ -1085,6 +1096,7 @@ def main():
         else:
             is_severe = pd.Series(True, index=aki_icd.index)
         pre = aki_icd[(aki_icd.days >= -90) & (aki_icd.days <= 0)]
+        washout_icd_pids = set(int(p) for p in pre.person_id)
         is_inc = ~aki_icd.person_id.isin(set(pre.person_id))
         aki_icd = aki_icd[is_severe | is_inc].copy()
         aki_icd = aki_icd[(aki_icd.days >= 1) & (aki_icd.days <= 365)]
@@ -1097,7 +1109,9 @@ def main():
         )
     else:
         icd_first = pd.DataFrame(columns=["person_id", "icd_evt_date"])
+        washout_icd_pids = set()
     print(f"  ICD AKI events: {len(icd_first):,}")
+    print(f"  Washout (ICD AKI dx in 90d pre-ICI): {len(washout_icd_pids)}")
     del aki_icd
     gc.collect()
 
@@ -1136,6 +1150,63 @@ def main():
     )
     del cr_first, icd_first
     gc.collect()
+
+    # ── Washout exclusion: pre-ICI AKI (Cr-based OR ICD-based) ──
+    washout_all = washout_cr_pids | washout_icd_pids
+    n_pre_washout = len(cohort)
+    cohort = cohort[~cohort.person_id.isin(washout_all)].copy()
+    n_excluded = n_pre_washout - len(cohort)
+    print(
+        f"\n  Washout applied: excluded {n_excluded} patients "
+        f"({len(washout_cr_pids)} Cr-based, {len(washout_icd_pids)} ICD-based, "
+        f"{len(washout_cr_pids & washout_icd_pids)} overlap)"
+    )
+    nt = len(cohort)
+    ne = int(cohort.aki_event.sum())
+    print(f"  Final cohort: {nt:,}, Events: {ne} ({ne/nt*100:.1f}%)")
+
+    # ── Survivorship QC: cancer dx → ICI timing ──────────────
+    print("\n  ── Survivorship / Immortal Time QC ──")
+    cdx_timing = (
+        cancer_dx_all[cancer_dx_all.person_id.isin(set(cohort.person_id))].copy()
+        if "cancer_dx_all" in dir()
+        else pd.DataFrame()
+    )
+    if len(cdx_timing) > 0:
+        cdx_timing["condition_start_date"] = parse_date(cdx_timing.condition_start_date)
+        cdx_first = (
+            cdx_timing.dropna(subset=["condition_start_date"])
+            .groupby("person_id")
+            .condition_start_date.min()
+            .rename("first_cancer_dx")
+        )
+        timing = cohort[["person_id", "ici_index_date"]].merge(
+            cdx_first, on="person_id", how="inner"
+        )
+        timing["dx_to_ici_days"] = (
+            timing.ici_index_date - timing.first_cancer_dx
+        ).dt.days
+        print(
+            f"    Cancer dx → ICI gap (days): "
+            f"median={timing.dx_to_ici_days.median():.0f}, "
+            f"IQR=[{timing.dx_to_ici_days.quantile(0.25):.0f}, "
+            f"{timing.dx_to_ici_days.quantile(0.75):.0f}]"
+        )
+        print(
+            f"    dx same day as ICI: {(timing.dx_to_ici_days <= 0).sum()} "
+            f"({(timing.dx_to_ici_days <= 0).mean()*100:.1f}%)"
+        )
+        print(
+            f"    dx >6mo before ICI: {(timing.dx_to_ici_days > 180).sum()} "
+            f"({(timing.dx_to_ici_days > 180).mean()*100:.1f}%)"
+        )
+        print(
+            f"    dx >1yr before ICI: {(timing.dx_to_ici_days > 365).sum()} "
+            f"({(timing.dx_to_ici_days > 365).mean()*100:.1f}%)"
+        )
+        del cdx_timing, cdx_first, timing
+    else:
+        print("    (cancer_dx_all already deleted — move this block earlier if needed)")
 
     # ══════════════════ STEP 4: DEMO + NCI-CCI + CANCER + NEPHRO ══
     print(
@@ -1178,6 +1249,29 @@ def main():
         f"  Age: mean={cohort.age.mean():.1f}  Sex: {cohort.sex.value_counts().to_dict()}"
     )
 
+    # ── Baseline eGFR from sCr (CKD-EPI 2021 race-free) ─────
+    # eGFR = 142 × min(Scr/κ, 1)^α × max(Scr/κ, 1)^(-1.200) × 0.9938^Age [× 1.012 if F]
+    scr = cohort.baseline_cr.values.astype(np.float64)
+    age_arr = cohort.age.values.astype(np.float64)
+    is_female = (cohort.sex == "Female").values
+    kappa = np.where(is_female, 0.7, 0.9)
+    alpha = np.where(is_female, -0.241, -0.302)
+    scr_over_k = scr / kappa
+    egfr = (
+        142
+        * np.power(np.minimum(scr_over_k, 1.0), alpha)
+        * np.power(np.maximum(scr_over_k, 1.0), -1.200)
+        * np.power(0.9938, age_arr)
+        * np.where(is_female, 1.012, 1.0)
+    )
+    cohort["baseline_egfr"] = egfr.astype(np.float32)
+    print(
+        f"  Baseline eGFR (CKD-EPI 2021): "
+        f"median={np.nanmedian(egfr):.1f}, "
+        f"IQR=[{np.nanpercentile(egfr, 25):.1f}, {np.nanpercentile(egfr, 75):.1f}], "
+        f"<60: {(egfr < 60).sum()} ({(egfr < 60).mean()*100:.1f}%)"
+    )
+
     # Cancer type
     cdx = cancer_dx_all[cancer_dx_all.person_id.isin(cohort_pids)].copy()
     del cancer_dx_all
@@ -1193,21 +1287,44 @@ def main():
             f"  Metastatic: {cohort.metastatic.sum():,} ({cohort.metastatic.mean()*100:.1f}%)"
         )
 
-        # Multi-cancer: >1 unique PRIMARY type per patient (excl metastatic codes)
+        # Multi-cancer: >1 unique ICI-RELEVANT type per patient (excl metastatic codes)
+        # Only count types with ICI indications; ignore Other_Solid (incidental C44 skin,
+        # C73 thyroid, etc. inflate multi_cancer to ~55%)
+        ICI_RELEVANT_TYPES = {
+            "Lung",
+            "Melanoma",
+            "Renal_Cell",
+            "Urothelial",
+            "Head_Neck",
+            "Hepatocellular",
+            "Colorectal",
+            "Hematologic",
+            "Breast",
+        }
         primary = cdx[~cdx.is_meta & cdx.cancer_type.notna()].copy()
-        types_per_pt = primary.groupby("person_id")["cancer_type"].apply(
+        # For multi_cancer determination, only count ICI-relevant types
+        primary_relevant = primary[primary.cancer_type.isin(ICI_RELEVANT_TYPES)]
+        types_per_pt = primary_relevant.groupby("person_id")["cancer_type"].apply(
+            lambda x: set(x)
+        )
+        # Also keep full type set for single-cancer assignment
+        all_types_per_pt = primary.groupby("person_id")["cancer_type"].apply(
             lambda x: set(x)
         )
         n_types = types_per_pt.apply(len).rename("n_cancer_types")
 
-        # Assign: multi_cancer if >1 type, else the single type
+        # Assign: multi_cancer only if >1 ICI-relevant type
         def _assign(pid):
-            if pid not in types_per_pt.index:
+            if pid not in all_types_per_pt.index:
                 return "Unknown"
-            ts = types_per_pt[pid]
-            if len(ts) > 1:
+            relevant = types_per_pt.get(pid, set())
+            if len(relevant) > 1:
                 return "multi_cancer"
-            return list(ts)[0]
+            if len(relevant) == 1:
+                return list(relevant)[0]
+            # No ICI-relevant type found — use most common from all types
+            all_ts = all_types_per_pt[pid]
+            return list(all_ts)[0] if len(all_ts) > 0 else "Unknown"
 
         cohort["cancer_type"] = cohort.person_id.apply(_assign)
     else:
@@ -1303,7 +1420,7 @@ def main():
     fn.append("ici_pdl1_mono")
     fc.append((cohort.ici_regimen == "pdl1_mono").values.astype(np.float32))
     ib.append(True)
-    fn.append("ici_combo")
+    fn.append("ici_ctla4")
     fc.append((cohort.ici_regimen == "combo").values.astype(np.float32))
     ib.append(True)
 
@@ -1359,6 +1476,22 @@ def main():
     ib.append(False)
     print(
         f"    bun_cr_ratio: {is_miss_bcr.sum()} missing ({is_miss_bcr.mean()*100:.1f}%)"
+    )
+
+    # Baseline eGFR (standardized, computed from sCr via CKD-EPI 2021)
+    egfr_v = cohort.baseline_egfr.values.astype(np.float64)
+    is_miss_egfr = np.isnan(egfr_v)
+    missing_flags["baseline_egfr"] = is_miss_egfr
+    egfr_ok = egfr_v[~is_miss_egfr]
+    mu_e = egfr_ok.mean() if len(egfr_ok) > 0 else 0.0
+    sd_e = egfr_ok.std() if len(egfr_ok) > 0 else 1.0
+    egfr_v = ((egfr_v - mu_e) / (sd_e + 1e-8)).astype(np.float32)
+    egfr_v[is_miss_egfr] = 0.0
+    fn.append("baseline_egfr")
+    fc.append(egfr_v)
+    ib.append(False)
+    print(
+        f"    baseline_egfr: {is_miss_egfr.sum()} missing ({is_miss_egfr.mean()*100:.1f}%)"
     )
 
     # AKI event (last)

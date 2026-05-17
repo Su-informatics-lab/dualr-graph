@@ -222,11 +222,13 @@ if i_mel is not None and i_rc is not None and i_oth is not None:
 
 # ICI regimen
 i_pdl1 = get_col("ici_pdl1_mono")
-i_combo = get_col("ici_combo")
+i_combo = get_col("ici_ctla4")
+if i_combo is None:
+    i_combo = get_col("ici_combo")  # backward compat
 if i_pdl1 is not None and i_combo is not None:
     ici_labels = np.array(["PD1_mono"] * N)
     ici_labels[X[:, i_pdl1] == 1] = "PDL1_mono"
-    ici_labels[X[:, i_combo] == 1] = "Combo"
+    ici_labels[X[:, i_combo] == 1] = "CTLA4"
     subgroups["ICI regimen"] = ici_labels
 
 # Race
