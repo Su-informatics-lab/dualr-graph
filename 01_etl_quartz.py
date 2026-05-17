@@ -1183,23 +1183,44 @@ def main():
     del cancer_dx_all
     if len(cdx) > 0:
         cdx["cancer_type"] = cdx.code.apply(classify_cancer)
-        cdx["condition_start_date"] = parse_date(cdx.condition_start_date)
-        cdx = cdx.merge(cohort[["person_id", "ici_index_date"]], on="person_id")
-        cdx["gap"] = abs((cdx.condition_start_date - cdx.ici_index_date).dt.days)
-        cp = (
-            cdx.sort_values("gap")
-            .groupby("person_id")
-            .first()
-            .reset_index()[["person_id", "cancer_type"]]
+        # Metastatic flag (C77-C80)
+        cdx["is_meta"] = cdx.code.apply(
+            lambda c: any(c.startswith(p) for p in ["C77", "C78", "C79", "C80"])
         )
-        cohort = cohort.merge(cp, on="person_id", how="left")
-        cohort["cancer_type"] = cohort.cancer_type.fillna("Unknown")
+        meta_pts = set(cdx[cdx.is_meta].person_id)
+        cohort["metastatic"] = cohort.person_id.isin(meta_pts).astype(int)
+        print(
+            f"  Metastatic: {cohort.metastatic.sum():,} ({cohort.metastatic.mean()*100:.1f}%)"
+        )
+
+        # Multi-cancer: >1 unique PRIMARY type per patient (excl metastatic codes)
+        primary = cdx[~cdx.is_meta & cdx.cancer_type.notna()].copy()
+        types_per_pt = primary.groupby("person_id")["cancer_type"].apply(
+            lambda x: set(x)
+        )
+        n_types = types_per_pt.apply(len).rename("n_cancer_types")
+
+        # Assign: multi_cancer if >1 type, else the single type
+        def _assign(pid):
+            if pid not in types_per_pt.index:
+                return "Unknown"
+            ts = types_per_pt[pid]
+            if len(ts) > 1:
+                return "multi_cancer"
+            return list(ts)[0]
+
+        cohort["cancer_type"] = cohort.person_id.apply(_assign)
     else:
         cohort["cancer_type"] = "Unknown"
+        cohort["metastatic"] = 0
+    # Collapse: Lung [ref], Melanoma, Renal_Cell, multi_cancer, Other
     cohort["cancer_collapsed"] = cohort.cancer_type.apply(
-        lambda c: c if c in ("Lung", "Melanoma", "Renal_Cell") else "Other"
+        lambda c: (
+            c if c in ("Lung", "Melanoma", "Renal_Cell", "multi_cancer") else "Other"
+        )
     )
-    print(f"  Cancer: {cohort.cancer_collapsed.value_counts().to_dict()}")
+    print(f"  Cancer raw: {cohort.cancer_type.value_counts().to_dict()}")
+    print(f"  Cancer collapsed: {cohort.cancer_collapsed.value_counts().to_dict()}")
 
     # NCI-CCI
     for cond, codes in NCI_CCI.items():
@@ -1287,9 +1308,17 @@ def main():
     ib.append(True)
 
     # Cancer type (ref=Lung)
-    for ct in ["Melanoma", "Renal_Cell", "Other"]:
+    for ct in ["Melanoma", "Renal_Cell", "multi_cancer", "Other"]:
         fn.append(f"cancer_{ct}")
         fc.append((cohort.cancer_collapsed == ct).values.astype(np.float32))
+        ib.append(True)
+
+    # Metastatic flag
+    if cohort.metastatic.mean() >= MIN_PREVALENCE and cohort.metastatic.mean() <= (
+        1 - MIN_PREVALENCE
+    ):
+        fn.append("metastatic")
+        fc.append(cohort.metastatic.values.astype(np.float32))
         ib.append(True)
 
     # Individual nephrotoxin classes
@@ -1299,23 +1328,38 @@ def main():
             fc.append(cohort[cls].values.astype(np.float32))
             ib.append(True)
 
-    # Baseline labs (standardized, NaN→0)
+    # Baseline labs (standardized; NO IMPUTATION — missing_mask.pt tracks NaNs)
+    missing_flags = {}
     for lab in ["bun", "hgb", "alb", "k"]:
         col = f"baseline_{lab}"
         v = cohort[col].values.astype(np.float64)
-        v = np.where(np.isnan(v), np.nanmedian(v), v)  # impute NaN with median
-        v = ((v - np.nanmean(v)) / (np.nanstd(v) + 1e-8)).astype(np.float32)
+        is_miss = np.isnan(v)
+        missing_flags[col] = is_miss
+        v_ok = v[~is_miss]
+        mu = v_ok.mean() if len(v_ok) > 0 else 0.0
+        sd = v_ok.std() if len(v_ok) > 0 else 1.0
+        v = ((v - mu) / (sd + 1e-8)).astype(np.float32)
+        v[is_miss] = 0.0  # neutral placeholder, NOT imputation
         fn.append(col)
         fc.append(v)
         ib.append(False)
+        print(f"    {col}: {is_miss.sum()} missing ({is_miss.mean()*100:.1f}%)")
 
-    # BUN/Cr ratio (standardized)
+    # BUN/Cr ratio
     bcr = cohort.bun_cr_ratio.values.astype(np.float64)
-    bcr = np.where(np.isnan(bcr), np.nanmedian(bcr), bcr)
-    bcr = ((bcr - np.nanmean(bcr)) / (np.nanstd(bcr) + 1e-8)).astype(np.float32)
+    is_miss_bcr = np.isnan(bcr)
+    missing_flags["bun_cr_ratio"] = is_miss_bcr
+    bcr_ok = bcr[~is_miss_bcr]
+    mu_b = bcr_ok.mean() if len(bcr_ok) > 0 else 0.0
+    sd_b = bcr_ok.std() if len(bcr_ok) > 0 else 1.0
+    bcr = ((bcr - mu_b) / (sd_b + 1e-8)).astype(np.float32)
+    bcr[is_miss_bcr] = 0.0
     fn.append("bun_cr_ratio")
     fc.append(bcr)
     ib.append(False)
+    print(
+        f"    bun_cr_ratio: {is_miss_bcr.sum()} missing ({is_miss_bcr.mean()*100:.1f}%)"
+    )
 
     # AKI event (last)
     fn.append("aki_event")
@@ -1341,6 +1385,22 @@ def main():
     torch.save(bm, os.path.join(OUT, "binary_mask.pt"))
     with open(os.path.join(OUT, "feature_names.json"), "w") as f:
         json.dump(fn, f, indent=2)
+
+    # Missing mask: [F, N] bool, True = value was missing (labs only)
+    miss_matrix = np.zeros((F, N), dtype=bool)
+    for feat_name, miss_arr in missing_flags.items():
+        if feat_name in fn:
+            idx = fn.index(feat_name)
+            miss_matrix[idx, :] = miss_arr
+    torch.save(
+        torch.tensor(miss_matrix, dtype=torch.bool),
+        os.path.join(OUT, "missing_mask.pt"),
+    )
+    n_miss_total = miss_matrix.sum()
+    print(
+        f"  missing_mask.pt: {n_miss_total:,} missing values across {len(missing_flags)} lab features"
+    )
+
     meta_cols = (
         ["person_id"]
         + list(AKI_WINDOWS.keys())
@@ -1349,7 +1409,7 @@ def main():
     cohort[[c for c in meta_cols if c in cohort.columns]].to_csv(
         os.path.join(OUT, "cohort_meta.csv"), index=False
     )
-    print(f"\n  Saved: [{F},{N}] feature_matrix.pt + cohort_meta.csv")
+    print(f"\n  Saved: [{F},{N}] feature_matrix.pt + missing_mask.pt + cohort_meta.csv")
 
     # ══════════════════ STEP 6: KM ════════════════════════════
     print("\n" + "=" * 70 + "\nSTEP 6: KM curve\n" + "=" * 70)
