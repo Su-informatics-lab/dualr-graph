@@ -37,7 +37,8 @@ for ARCH in transformer gatv2 gcn; do
     echo ""
     echo ">>> ${ARCH} × spearman"
     python train.py --arch ${ARCH} --edge_method spearman --k 8 \
-        --epochs 300 --patience 30 --wandb
+        --epochs 300 --patience 30 --wandb \
+        --run_name "${ARCH}_spearman_k8"
 done
 
 # ── MI × 3 architectures ──
@@ -49,7 +50,8 @@ for ARCH in transformer gatv2 gcn; do
     echo ""
     echo ">>> ${ARCH} × mi"
     python train.py --arch ${ARCH} --edge_method mi --k 8 \
-        --epochs 300 --patience 30 --wandb
+        --epochs 300 --patience 30 --wandb \
+        --run_name "${ARCH}_mi_k8"
 done
 
 # ── LLM edges (conditional — may not be ready yet) ──
@@ -66,15 +68,16 @@ if [ -f data/llm_adj.npy ]; then
         echo ""
         echo ">>> ${ARCH} × llm"
         python train.py --arch ${ARCH} --edge_method llm --k 8 \
-            --epochs 300 --patience 30 --wandb
+            --epochs 300 --patience 30 --wandb \
+            --run_name "${ARCH}_llm_k8"
     done
 else
     echo ">>> llm_adj.npy not found — skipping LLM runs."
-    echo ">>> Re-run this block manually after LLM edges complete:"
+    echo ">>> Re-run after LLM edges complete:"
     echo ">>>   python graph.py --method llm --k 8 --llm_prior data/llm_adj.npy"
-    echo ">>>   python train.py --arch transformer --edge_method llm --k 8 --wandb"
-    echo ">>>   python train.py --arch gatv2 --edge_method llm --k 8 --wandb"
-    echo ">>>   python train.py --arch gcn --edge_method llm --k 8 --wandb"
+    echo ">>>   python train.py --arch transformer --edge_method llm --k 8 --wandb --run_name transformer_llm_k8"
+    echo ">>>   python train.py --arch gatv2 --edge_method llm --k 8 --wandb --run_name gatv2_llm_k8"
+    echo ">>>   python train.py --arch gcn --edge_method llm --k 8 --wandb --run_name gcn_llm_k8"
 fi
 
 echo ""

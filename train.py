@@ -349,9 +349,21 @@ def main():
     parser.add_argument("--data_dir", type=str, default="data")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="graphai-ici-aki")
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default=None,
+        help="W&B run name. Auto-generated if not set.",
+    )
     args = parser.parse_args()
 
     config = vars(args)
+
+    # Auto-generate run name if not provided
+    run_name = (
+        args.run_name
+        or f"{args.arch}_{args.edge_method}_k{args.k}_h{args.hidden}_l{args.latent}"
+    )
 
     wandb_run = None
     if args.wandb:
@@ -359,6 +371,7 @@ def main():
 
         wandb_run = wandb.init(
             project=args.wandb_project,
+            name=run_name,
             config=config,
             group=f"{args.arch}_{args.edge_method}_k{args.k}",
             tags=["npj-pilot", args.arch, args.edge_method],
