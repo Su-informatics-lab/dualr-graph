@@ -173,7 +173,7 @@ for mname, mfn in models.items():
 # Also run Cox on 6-month data
 df_6m = pd.DataFrame(X_6m, columns=feat_names)
 df_6m["T"] = meta_6m["surv_days"].clip(upper=landmark).values
-df_6m["E"] = y_6m.values
+df_6m["E"] = y_6m
 cis_6m = []
 for tr, te in skf6.split(X_6m, y_6m):
     c = CoxPHFitter(penalizer=0.01)
