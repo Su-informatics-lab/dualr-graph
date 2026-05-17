@@ -563,6 +563,10 @@ def main():
     ):
         n_drug_total += len(chunk)
         chunk.columns = [c.lower() for c in chunk.columns]
+        # Ensure person_id is numeric
+        chunk["person_id"] = pd.to_numeric(chunk["person_id"], errors="coerce")
+        chunk = chunk.dropna(subset=["person_id"])
+        chunk["person_id"] = chunk["person_id"].astype(int)
         # Fast keyword filter on drug_source_value
         mask = (
             chunk["drug_source_value"]
@@ -603,7 +607,8 @@ def main():
     # anti_lag3 → fold into pd1
     has_lag3 = ici_index.ici_classes.apply(lambda s: "anti_lag3" in s)
     ici_index.loc[has_lag3, "ici_pd1"] = 1
-    ici_pids = set(ici_index.person_id)
+    # Force plain Python int to avoid numpy dtype mismatch across tables
+    ici_pids = set(int(p) for p in ici_index.person_id)
 
     for c in ["ici_pd1", "ici_pdl1", "ici_ctla4"]:
         print(f"    {c}: {ici_index[c].sum():,}")
@@ -627,8 +632,10 @@ def main():
     patient_codes = {}  # pid → set of normalized ICD codes
 
     n_cond_total = 0
+    n_ici_cond_rows = 0  # track rows passing ICI filter
     cond_path = f"{DATA}/r6335_condition_occurrence.csv"
     cond_cols = resolve_cols(cond_path, ["person_id", "condition_source_value"])
+    _first_chunk = True
     for chunk in pd.read_csv(
         cond_path,
         low_memory=False,
@@ -637,8 +644,31 @@ def main():
     ):
         n_cond_total += len(chunk)
         chunk.columns = [c.lower() for c in chunk.columns]
+
+        # Diagnostic on first chunk
+        if _first_chunk:
+            print(
+                f"  [diag] cond person_id dtype={chunk.person_id.dtype}, "
+                f"sample={chunk.person_id.head(3).tolist()}"
+            )
+            print(
+                f"  [diag] ici_pids type={type(next(iter(ici_pids)))}, "
+                f"sample={list(ici_pids)[:3]}"
+            )
+            print(
+                f"  [diag] cond_source_value sample="
+                f"{chunk.condition_source_value.head(3).tolist()}"
+            )
+            _first_chunk = False
+
+        # Ensure person_id is numeric (handles string/float from CSV)
+        chunk["person_id"] = pd.to_numeric(chunk["person_id"], errors="coerce")
+        chunk = chunk.dropna(subset=["person_id"])
+        chunk["person_id"] = chunk["person_id"].astype(int)
+
         # Filter to ICI patients only
         chunk = chunk[chunk.person_id.isin(ici_pids)]
+        n_ici_cond_rows += len(chunk)
         if chunk.empty:
             continue
 
@@ -669,6 +699,7 @@ def main():
             patient_codes[pid].add(code)
 
     print(f"  Scanned {n_cond_total:,} condition rows")
+    print(f"  ICI patient condition rows: {n_ici_cond_rows:,}")
     print(f"  ICI + cancer dx: {len(cancer_pids & ici_pids):,}")
     print(f"  ESKD patients: {len(eskd_pids & ici_pids):,}")
     print(f"  Mem: {mem_mb():.0f} MB")
@@ -702,14 +733,14 @@ def main():
     ) & concept_cr.concept_name.str.contains(
         "serum|blood|plasma|Creatinine in S", case=False, na=False
     )
-    cr_concepts = set(concept_cr.loc[cr_mask, "concept_id"].tolist())
+    cr_concepts = set(int(c) for c in concept_cr.loc[cr_mask, "concept_id"].tolist())
     # Add known LOINC concept for serum creatinine
     cr_concepts.add(3016723)  # AoU/OMOP standard for LOINC 2160-0
     del concept_cr
     gc.collect()
     print(f"  Creatinine concept IDs: {len(cr_concepts)}")
 
-    valid_pid_set = set(ici_index.person_id)
+    valid_pid_set = set(int(p) for p in ici_index.person_id)
     cr_rows = []
     n_meas_total = 0
     meas_path = f"{DATA}/r6335_measurement.csv"
@@ -725,6 +756,27 @@ def main():
     ):
         n_meas_total += len(chunk)
         chunk.columns = [c.lower() for c in chunk.columns]
+
+        # Diagnostic on first chunk
+        if n_meas_total == len(chunk):
+            print(
+                f"  [diag] meas person_id dtype={chunk.person_id.dtype}, "
+                f"sample={chunk.person_id.head(3).tolist()}"
+            )
+            print(
+                f"  [diag] meas concept_id dtype="
+                f"{chunk.measurement_concept_id.dtype}"
+            )
+
+        # Ensure person_id + concept_id are numeric
+        chunk["person_id"] = pd.to_numeric(chunk["person_id"], errors="coerce")
+        chunk["measurement_concept_id"] = pd.to_numeric(
+            chunk["measurement_concept_id"], errors="coerce"
+        )
+        chunk = chunk.dropna(subset=["person_id", "measurement_concept_id"])
+        chunk["person_id"] = chunk["person_id"].astype(int)
+        chunk["measurement_concept_id"] = chunk["measurement_concept_id"].astype(int)
+
         # Filter: ICI patients + creatinine concepts
         chunk = chunk[
             chunk.person_id.isin(valid_pid_set)
@@ -738,11 +790,17 @@ def main():
     gc.collect()
     print(f"  Scanned {n_meas_total:,} measurement rows")
     print(f"  Creatinine records: {len(cr):,}")
-    print(f"  Patients with Cr: {cr.person_id.nunique():,}")
-    print(f"  Mem: {mem_mb():.0f} MB")
 
     if len(cr) == 0:
-        raise RuntimeError("No creatinine measurements found — check concept IDs")
+        raise RuntimeError(
+            f"No creatinine measurements found.\n"
+            f"  valid_pid_set size: {len(valid_pid_set)}\n"
+            f"  cr_concepts size: {len(cr_concepts)}\n"
+            f"  Check: Step 2 produced 0 patients → no Cr to find."
+        )
+
+    print(f"  Patients with Cr: {cr.person_id.nunique():,}")
+    print(f"  Mem: {mem_mb():.0f} MB")
 
     cr["measurement_date"] = parse_date(cr["measurement_date"])
     cr["value_as_number"] = pd.to_numeric(cr["value_as_number"], errors="coerce")
