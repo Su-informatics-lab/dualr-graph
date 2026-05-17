@@ -210,11 +210,14 @@ subgroups = {}
 i_mel = get_col("cancer_Melanoma")
 i_rc = get_col("cancer_Renal_Cell")
 i_oth = get_col("cancer_Other")
+i_mc = get_col("cancer_multi_cancer")
 if i_mel is not None and i_rc is not None and i_oth is not None:
     cancer_labels = np.array(["Lung"] * N)
     cancer_labels[X[:, i_mel] == 1] = "Melanoma"
     cancer_labels[X[:, i_rc] == 1] = "Renal_Cell"
     cancer_labels[X[:, i_oth] == 1] = "Other"
+    if i_mc is not None:
+        cancer_labels[X[:, i_mc] == 1] = "Multi_cancer"
     subgroups["Cancer type"] = cancer_labels
 
 # ICI regimen
@@ -250,20 +253,26 @@ if i_age is not None:
     )
     subgroups["Age tertile"] = age_labels
 
-# Lab availability (all labs present vs missing)
-i_bun = get_col("baseline_bun")
-i_hgb = get_col("baseline_hgb")
-i_alb = get_col("baseline_alb")
-i_k = get_col("baseline_k")
-if all(i is not None for i in [i_bun, i_hgb, i_alb, i_k]):
-    # After standardization, median-imputed values are ~0. Hard to detect.
-    # Instead use: if all 4 labs have the exact same z-score pattern → likely imputed
-    # Simpler: just use BUN as proxy (all labs have same coverage)
-    lab_labels = np.array(["has_labs"] * N)
-    # Values exactly at 0 after standardization are likely imputed
-    # But this isn't reliable. Let's just split by value variance
-    lab_labels = np.array(["has_labs"] * N)  # placeholder
-    subgroups["Labs available"] = lab_labels
+# Lab availability — use missing_mask.pt if available
+try:
+    miss_mask = torch.load("data/missing_mask.pt", weights_only=True).numpy()  # [F, N]
+    # Any lab missing → "missing_labs"
+    lab_feat_idx = [
+        feat_names.index(f"baseline_{l}")
+        for l in ["bun", "hgb", "alb", "k"]
+        if f"baseline_{l}" in feat_names
+    ]
+    if lab_feat_idx:
+        # missing_mask has F+1 rows (includes aki_event), feat_mask remapped
+        any_lab_missing = np.zeros(N, dtype=bool)
+        for fi in lab_feat_idx:
+            # feat_mask[fi] is the original row in feature_matrix
+            orig_row = feat_mask[fi]
+            any_lab_missing |= miss_mask[orig_row, :]
+        lab_labels = np.where(any_lab_missing, "missing_labs", "has_labs")
+        subgroups["Labs available"] = lab_labels
+except FileNotFoundError:
+    pass  # no missing mask → skip this subgroup
 
 # Nephrotoxin subgroups
 i_ppi = get_col("nephro_ppi")
@@ -286,23 +295,34 @@ for sg_name, sg_labels in subgroups.items():
         e_sub = y_event[mask].sum()
         rate = y_event[mask].mean()
 
-        # Cox on subgroup
+        # Cox on subgroup — drop constant columns (zero variance)
         df_sub = df_cox[mask].copy()
+        n_dropped = 0
         if len(df_sub) < 50 or e_sub < 10:
             ci = float("nan")
         else:
             try:
-                c_sub = CoxPHFitter(penalizer=0.1)
-                c_sub.fit(df_sub, duration_col="T", event_col="E")
-                ci = concordance_index(
-                    df_sub["T"], -c_sub.predict_partial_hazard(df_sub), df_sub["E"]
-                )
-            except:
+                # Drop features that are constant in this subgroup
+                feat_cols = [c for c in df_sub.columns if c not in ("T", "E")]
+                const_cols = [c for c in feat_cols if df_sub[c].nunique() <= 1]
+                n_dropped = len(const_cols)
+                df_fit = df_sub.drop(columns=const_cols)
+
+                if len([c for c in df_fit.columns if c not in ("T", "E")]) == 0:
+                    ci = float("nan")
+                else:
+                    c_sub = CoxPHFitter(penalizer=0.1)
+                    c_sub.fit(df_fit, duration_col="T", event_col="E")
+                    ci = concordance_index(
+                        df_fit["T"], -c_sub.predict_partial_hazard(df_fit), df_fit["E"]
+                    )
+            except Exception:
                 ci = float("nan")
 
+        dropped = f" (dropped {n_dropped})" if n_dropped > 0 else ""
         flag = " ← LOW" if ci < 0.60 else ""
         print(
-            f"  {sg_name:<20s} {level:<15s} {n_sub:>6} {int(e_sub):>7} {rate:>7.3f} {ci:>8.4f}{flag}"
+            f"  {sg_name:<20s} {level:<15s} {n_sub:>6} {int(e_sub):>7} {rate:>7.3f} {ci:>8.4f}{flag}{dropped}"
         )
 
 # ═══════════════════════════════════════════════════════════════
