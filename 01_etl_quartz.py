@@ -1140,13 +1140,32 @@ def main():
         cohort.loc[~he, ["last_obs_date", "max_fu"]].min(axis=1)
         - cohort.loc[~he, "ici_index_date"]
     ).dt.days
-    cohort["surv_days"] = cohort.surv_days.clip(lower=1, upper=365).astype(int)
+
+    # ── PRIMARY ENDPOINT: 6-month Cr≥1.5× (180 days) ─────────
+    # Keep 12-month event for sensitivity analysis
+    cohort["aki_event_12m"] = cohort["aki_event"].copy()
+    cohort["surv_days_12m"] = cohort["surv_days"].copy()
+
+    # Redefine: events after 180 days → censored at 180
+    late_event = (cohort.aki_event == 1) & (cohort.surv_days > 180)
+    cohort.loc[late_event, "aki_event"] = 0
+    cohort.loc[late_event, "evt_source"] = "none"
+    cohort["surv_days"] = cohort.surv_days.clip(lower=1, upper=180).astype(int)
+
     nt = len(cohort)
     ne = int(cohort.aki_event.sum())
+    ne_12m = int(cohort.aki_event_12m.sum())
     ncr = int((cohort.evt_source == "cr").sum())
     nicd = int((cohort.evt_source == "icd").sum())
+    n_reclassified = int(late_event.sum())
+    print(f"  Total: {nt:,}")
     print(
-        f"  Total: {nt:,}, Events: {ne} ({ne/nt*100:.1f}%), Cr-first: {ncr}, ICD-first: {nicd}"
+        f"  6-month events (primary): {ne} ({ne/nt*100:.1f}%), "
+        f"Cr-first: {ncr}, ICD-first: {nicd}"
+    )
+    print(
+        f"  12-month events (sensitivity): {ne_12m} ({ne_12m/nt*100:.1f}%), "
+        f"reclassified to control: {n_reclassified}"
     )
     del cr_first, icd_first
     gc.collect()
@@ -1537,7 +1556,7 @@ def main():
     meta_cols = (
         ["person_id"]
         + list(AKI_WINDOWS.keys())
-        + ["aki_event", "surv_days", "evt_source"]
+        + ["aki_event", "surv_days", "aki_event_12m", "surv_days_12m", "evt_source"]
     )
     cohort[[c for c in meta_cols if c in cohort.columns]].to_csv(
         os.path.join(OUT, "cohort_meta.csv"), index=False
@@ -1560,16 +1579,16 @@ def main():
         kt = np.concatenate([[0], ut])
         ks = np.concatenate([[1.0], sp])
     else:
-        kt = np.array([0, 365])
+        kt = np.array([0, 180])
         ks = np.array([1.0, 1.0])
         sp = np.array([1.0])
-    rt = [0, 30, 60, 90, 120, 180, 270, 365]
+    rt = [0, 30, 60, 90, 120, 150, 180]
     rc = [int(np.sum(ts >= r)) for r in rt]
     fig, ax = plt.subplots(figsize=(3.504, 2.8))
     ax.step(kt, ks, where="post", color="#0072B2", linewidth=1.2, label=f"n={nt:,}")
     ax.set_xlabel("Days from ICI")
     ax.set_ylabel("AKI-free survival")
-    ax.set_xlim(0, 370)
+    ax.set_xlim(0, 185)
     ax.set_ylim(0, 1.05)
     ax.set_xticks(rt)
     ax.text(
@@ -1583,7 +1602,7 @@ def main():
     )
     for r, c in zip(rt, rc):
         ax.text(
-            r / 370,
+            r / 185,
             -0.28,
             str(c),
             transform=ax.transAxes,
