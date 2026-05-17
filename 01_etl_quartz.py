@@ -675,7 +675,7 @@ def main():
         # INPC format: "1284^^H35.341" → extract ICD after "^^"
         raw = chunk.condition_source_value.astype(str)
         chunk["code"] = (
-            raw.str.split("^^")
+            raw.str.split("^^", regex=False)
             .str[-1]  # take part after ^^
             .str.upper()
             .str.replace(".", "", regex=False)
