@@ -1,0 +1,80 @@
+# Graph Transformer Autoencoder for ICI→AKI
+# Config for npj Digital Medicine pilot
+# ─────────────────────────────────────────
+
+data:
+  # INPC structured data dump (read by 01_inpc_etl.py in post_ici_aki_disparity)
+  inpc_base_csv: "data/inpc_07_pre_matching_base.csv"
+  # Output from this pipeline's ETL
+  feature_matrix: "data/feature_matrix.pt"
+  feature_names:  "data/feature_names.json"
+  binary_mask:    "data/binary_mask.pt"
+
+  # Outcome windows (separate experiments)
+  windows:
+    - label: "AKI-3m"
+      column: "severity"       # Cr ≥2.0× baseline, 365d (primary from INPC ETL)
+      max_days: 90
+    - label: "AKI-6m"
+      column: "severity"
+      max_days: 180
+    - label: "AKI-12m"
+      column: "severity"
+      max_days: 365
+
+  # Drop NCI-CCI flags with prevalence below this threshold
+  min_prevalence: 0.01
+
+graph:
+  methods: ["spearman", "mi", "llm"]
+  k_default: 8
+  min_edge_weight: 0.01
+
+model:
+  architectures: ["transformer", "gatv2", "gcn"]
+  primary: "transformer"
+
+tune:
+  phase1:
+    n_trials: 100
+    cv_folds: 3
+    sampler: "random"
+  phase2:
+    n_trials: 200
+    cv_folds: 5
+    sampler: "tpe"
+    pruner: "median"
+    pruner_warmup: 2
+
+  search_space:
+    hidden: [32, 64, 128]
+    latent: [8, 16, 32, 64]
+    heads: [1, 2, 4, 8]
+    lr: [1.0e-4, 1.0e-2]          # log-uniform
+    weight_decay: [1.0e-6, 1.0e-3] # log-uniform
+    dropout: [0.1, 0.5]            # uniform
+    lambda_ce: [0.1, 10.0]         # log-uniform
+    k_neighbors: [5, 8, 10, 15]
+    epochs: [200, 300, 500]
+
+train:
+  patience: 30
+  grad_clip: 5.0
+  eval_every: 10
+  scheduler: "cosine"
+
+eval:
+  metrics: ["auroc", "auprc", "brier", "sens_at_spec90"]
+  ci_method: "fold"  # 95% CI from fold-level estimates
+
+wandb:
+  project: "graphai-ici-aki"
+  entity: null  # set via env or CLI
+  tags_prefix: ["npj-pilot"]
+
+llm_edges:
+  model: "meta-llama/Llama-3.1-8B-Instruct"
+  disease_context: "acute kidney injury following immune checkpoint inhibitor therapy"
+  n_reps: 10
+  temperature: 0.6
+  max_tokens: 512
