@@ -199,7 +199,7 @@ def train_one_fold(
 
 def run_cv(config, data_dir="data", wandb_run=None):
     """Run stratified k-fold CV and return fold-level metrics."""
-    from _02_graph import build_mi, build_spearman, knn_sparsify
+    from graph import build_mi, build_spearman, knn_sparsify
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
