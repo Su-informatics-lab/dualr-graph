@@ -8,8 +8,8 @@ to Tempest.
 
 Strategy to stay under memory limit:
   - Chunk-read all large tables (drug, condition, measurement)
-  - Filter to ICI patient IDs ASAP (drug_source_value keyword match,
-    no full concept join)
+  - Filter to ICI patient IDs ASAP
+  - Use both drug_source_value keyword matching and OMOP concept_id matching
   - Never hold more than one chunk of a large table at once
   - Explicit gc.collect() after each large table pass
 
@@ -29,6 +29,7 @@ Usage:
 import gc
 import json
 import os
+import re
 import warnings
 
 import numpy as np
@@ -44,14 +45,14 @@ DATA = "/N/project/depot/hw56/irAKI_data/structured_data"
 OUT = "data"
 os.makedirs(OUT, exist_ok=True)
 
-CHUNK = 500_000  # rows per chunk for large CSVs
+CHUNK = 500_000  # rows per chunk for large csvs
 MIN_PREVALENCE = 0.01
 CR_RATIO_THRESHOLD = 2.0  # Cr ≥ 2.0× baseline
 
 AKI_WINDOWS = {"aki_3m": 90, "aki_6m": 180, "aki_12m": 365}
 PRIMARY_WINDOW = "aki_12m"
 
-# ── ICI keyword matching (on drug_source_value, no concept join) ──
+# ── ICI keyword/concept matching ──
 ICI_KEYWORDS = {
     "anti_pd1": [
         "nivolumab",
@@ -67,6 +68,8 @@ ICI_KEYWORDS = {
     "anti_lag3": ["relatlimab"],
 }
 ALL_ICI_KW = [kw for v in ICI_KEYWORDS.values() for kw in v]
+ICI_NAME_TO_CLASS = {kw: cls for cls, kws in ICI_KEYWORDS.items() for kw in kws}
+ICI_REGEX = "|".join(re.escape(kw) for kw in ALL_ICI_KW)
 
 
 def classify_ici(text):
@@ -93,6 +96,7 @@ def mem_mb():
                     return int(line.split()[1]) / 1024
     except Exception:
         return 0
+    return 0
 
 
 # ── NCI-CCI code sets (14 conditions, excludes Malignancy/Metastatic) ──
@@ -510,6 +514,7 @@ NEPHROTOXIN_KW = [
     "cisplatin",
     "carboplatin",
 ]
+NEPHROTOXIN_REGEX = "|".join(re.escape(kw) for kw in NEPHROTOXIN_KW)
 
 
 def code_matches(code_str, prefixes):
@@ -532,6 +537,93 @@ def resolve_cols(csv_path, wanted, encoding=None):
     return resolved
 
 
+def resolve_optional_cols(csv_path, wanted, encoding=None):
+    """Return existing optional columns in the file's actual case."""
+    header = pd.read_csv(csv_path, nrows=0, encoding=encoding).columns.tolist()
+    lower_map = {c.lower(): c for c in header}
+    return [lower_map[w.lower()] for w in wanted if w.lower() in lower_map]
+
+
+def normalize_pid_column(df, col="person_id"):
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=[col]).copy()
+    df[col] = df[col].astype(int)
+    return df
+
+
+def load_ici_concept_map(concept_path):
+    """Map OMOP concept_id/source concept_id to ICI class by concept_name."""
+    concept_cols = resolve_cols(
+        concept_path, ["concept_id", "concept_name"], encoding="cp1252"
+    )
+    concept_to_class = {}
+
+    for chunk in pd.read_csv(
+        concept_path,
+        encoding="cp1252",
+        low_memory=False,
+        chunksize=CHUNK,
+        usecols=concept_cols,
+    ):
+        chunk.columns = [c.lower() for c in chunk.columns]
+        chunk["concept_id"] = pd.to_numeric(chunk["concept_id"], errors="coerce")
+        chunk = chunk.dropna(subset=["concept_id"])
+        if chunk.empty:
+            continue
+        chunk["concept_id"] = chunk["concept_id"].astype(int)
+        names = chunk["concept_name"].astype(str).str.lower()
+        for drug_name, ici_class in ICI_NAME_TO_CLASS.items():
+            mask = names.str.contains(drug_name, regex=False, na=False)
+            if mask.any():
+                for cid in chunk.loc[mask, "concept_id"]:
+                    concept_to_class[int(cid)] = ici_class
+
+    return concept_to_class
+
+
+def load_creatinine_concepts(concept_path):
+    """Find creatinine measurement concept IDs without holding all concept rows."""
+    concept_cols = resolve_cols(
+        concept_path, ["concept_id", "concept_name"], encoding="cp1252"
+    )
+    cr_concepts = set()
+
+    for chunk in pd.read_csv(
+        concept_path,
+        encoding="cp1252",
+        low_memory=False,
+        chunksize=CHUNK,
+        usecols=concept_cols,
+    ):
+        chunk.columns = [c.lower() for c in chunk.columns]
+        chunk["concept_id"] = pd.to_numeric(chunk["concept_id"], errors="coerce")
+        chunk = chunk.dropna(subset=["concept_id"])
+        if chunk.empty:
+            continue
+        chunk["concept_id"] = chunk["concept_id"].astype(int)
+        names = chunk["concept_name"].astype(str)
+        cr_mask = names.str.contains(
+            "reatinine", case=False, na=False
+        ) & names.str.contains(
+            "serum|blood|plasma|Creatinine in S", case=False, na=False, regex=True
+        )
+        if cr_mask.any():
+            cr_concepts.update(int(c) for c in chunk.loc[cr_mask, "concept_id"])
+
+    cr_concepts.add(3016723)  # LOINC 2160-0, serum/plasma creatinine
+    return cr_concepts
+
+
+def add_numeric_concept_columns(chunk, concept_cols):
+    for c in concept_cols:
+        chunk[c] = pd.to_numeric(chunk[c], errors="coerce")
+    return chunk
+
+
+def concept_id_series(chunk, col):
+    return chunk[col].fillna(-1).astype(np.int64)
+
+
 # ═══════════════════════════════════════════════════════════════════
 def main():
     print("=" * 70)
@@ -541,6 +633,12 @@ def main():
     print(f"  Output: {OUT}/")
     print(f"  Mem:    {mem_mb():.0f} MB")
 
+    drug_path = f"{DATA}/r6335_drug_exposure.csv"
+    cond_path = f"{DATA}/r6335_condition_occurrence.csv"
+    meas_path = f"{DATA}/r6335_measurement.csv"
+    concept_path = f"{DATA}/r6335_concept.csv"
+    person_path = f"{DATA}/r6335_person.csv"
+
     # ══════════════════════════════════════════════════════════════
     # STEP 1: FIND ICI PATIENTS (chunked drug_exposure scan)
     # ══════════════════════════════════════════════════════════════
@@ -548,13 +646,34 @@ def main():
     print("STEP 1: ICI Cohort (chunked drug_exposure scan)")
     print("=" * 70)
 
-    # Collect ICI exposures: person_id, date, class
-    ici_rows = []
-    n_drug_total = 0
-    drug_path = f"{DATA}/r6335_drug_exposure.csv"
-    drug_cols = resolve_cols(
+    print("  Loading ICI concept IDs from concept table...")
+    ici_concept_to_class = load_ici_concept_map(concept_path)
+    ici_concept_ids = set(ici_concept_to_class)
+    print(f"  ICI concept IDs: {len(ici_concept_ids):,}")
+    if not ici_concept_ids:
+        raise RuntimeError("No ICI concept IDs found from concept table")
+
+    # use drug_concept_id and, when present, drug_source_concept_id for coded rows
+    drug_base_cols = resolve_cols(
         drug_path, ["person_id", "drug_exposure_start_date", "drug_source_value"]
     )
+    drug_concept_cols_original = resolve_optional_cols(
+        drug_path, ["drug_concept_id", "drug_source_concept_id"]
+    )
+    if not drug_concept_cols_original:
+        raise ValueError(
+            "Neither drug_concept_id nor drug_source_concept_id found in drug_exposure. "
+            "Concept-based ICI detection cannot run."
+        )
+    drug_cols = drug_base_cols + drug_concept_cols_original
+    drug_concept_cols = [c.lower() for c in drug_concept_cols_original]
+    print(f"  ICI concept matching columns: {drug_concept_cols}")
+
+    ici_rows = []
+    n_drug_total = 0
+    n_keyword_hits = 0
+    n_concept_hits = 0
+
     for chunk in pd.read_csv(
         drug_path,
         low_memory=False,
@@ -563,35 +682,67 @@ def main():
     ):
         n_drug_total += len(chunk)
         chunk.columns = [c.lower() for c in chunk.columns]
-        # Ensure person_id is numeric
-        chunk["person_id"] = pd.to_numeric(chunk["person_id"], errors="coerce")
-        chunk = chunk.dropna(subset=["person_id"])
-        chunk["person_id"] = chunk["person_id"].astype(int)
-        # Fast keyword filter on drug_source_value
-        mask = (
-            chunk["drug_source_value"]
-            .astype(str)
-            .str.lower()
-            .apply(lambda x: any(kw in x for kw in ALL_ICI_KW))
-        )
-        if mask.any():
-            hits = chunk[mask].copy()
-            hits["ici_class"] = hits["drug_source_value"].apply(classify_ici)
-            ici_rows.append(hits[hits.ici_class.notna()])
+        chunk = normalize_pid_column(chunk, "person_id")
+        chunk = add_numeric_concept_columns(chunk, drug_concept_cols)
+
+        source_text = chunk["drug_source_value"].astype(str)
+        kw_mask = source_text.str.contains(ICI_REGEX, case=False, regex=True, na=False)
+
+        concept_mask = pd.Series(False, index=chunk.index)
+        for cid_col in drug_concept_cols:
+            concept_mask = concept_mask | concept_id_series(chunk, cid_col).isin(
+                ici_concept_ids
+            )
+
+        n_keyword_hits += int(kw_mask.sum())
+        n_concept_hits += int(concept_mask.sum())
+
+        mask = kw_mask | concept_mask
+        if not mask.any():
+            continue
+
+        hits = chunk.loc[mask].copy()
+        classes = hits["drug_source_value"].apply(classify_ici)
+        for cid_col in drug_concept_cols:
+            missing = classes.isna()
+            if not missing.any():
+                break
+            mapped = concept_id_series(hits.loc[missing], cid_col).map(
+                ici_concept_to_class
+            )
+            classes.loc[missing] = mapped
+
+        hits["ici_class"] = classes
+        hits = hits[hits.ici_class.notna()].copy()
+        if not hits.empty:
+            keep_cols = [
+                "person_id",
+                "drug_exposure_start_date",
+                "drug_source_value",
+                *drug_concept_cols,
+                "ici_class",
+            ]
+            ici_rows.append(hits[keep_cols])
 
     ici = pd.concat(ici_rows, ignore_index=True) if ici_rows else pd.DataFrame()
     del ici_rows
     gc.collect()
     print(f"  Scanned {n_drug_total:,} drug rows")
+    print(f"  ICI keyword hits: {n_keyword_hits:,}")
+    print(f"  ICI concept hits: {n_concept_hits:,}")
     print(f"  ICI exposures found: {len(ici):,}")
+
+    if len(ici) == 0:
+        raise RuntimeError(
+            "No ICI exposures found. Check drug_source_value keywords and concept_id mapping."
+        )
+
     print(f"  Unique ICI patients: {ici.person_id.nunique():,}")
     print(f"  Mem: {mem_mb():.0f} MB")
 
-    if len(ici) == 0:
-        raise RuntimeError("No ICI exposures found — check drug_source_value keywords")
-
-    # ICI index date + regimen flags
     ici["drug_exposure_start_date"] = parse_date(ici["drug_exposure_start_date"])
+    ici = ici.dropna(subset=["drug_exposure_start_date"])
+
     ici_index = (
         ici.groupby("person_id")
         .agg(
@@ -600,21 +751,21 @@ def main():
         )
         .reset_index()
     )
+
     for cls in ["anti_pd1", "anti_pdl1", "anti_ctla4"]:
         ici_index[f"ici_{cls.replace('anti_', '')}"] = ici_index["ici_classes"].apply(
             lambda s: int(cls in s)
         )
-    # anti_lag3 → fold into pd1
+
+    # anti_lag3 is folded into pd1 for feature construction
     has_lag3 = ici_index.ici_classes.apply(lambda s: "anti_lag3" in s)
     ici_index.loc[has_lag3, "ici_pd1"] = 1
-    # Force plain Python int to avoid numpy dtype mismatch across tables
+
     ici_pids = set(int(p) for p in ici_index.person_id)
 
     for c in ["ici_pd1", "ici_pdl1", "ici_ctla4"]:
         print(f"    {c}: {ici_index[c].sum():,}")
 
-    # Free raw ICI exposures (keep ici_index only)
-    # But we need drug data later for nephrotoxins — save ICI dates
     ici_dates = ici_index[["person_id", "ici_index_date"]].copy()
     del ici
     gc.collect()
@@ -628,14 +779,16 @@ def main():
 
     cancer_pids = set()
     eskd_pids = set()
-    # Also collect ICD codes per ICI patient for NCI-CCI (step 4)
     patient_codes = {}  # pid → set of normalized ICD codes
 
+    cancer_norm = [p.upper().replace(".", "") for p in CANCER_PREFIXES_10]
+    eskd_norm = [p.upper().replace(".", "") for p in ESKD_PREFIXES]
+
     n_cond_total = 0
-    n_ici_cond_rows = 0  # track rows passing ICI filter
-    cond_path = f"{DATA}/r6335_condition_occurrence.csv"
+    n_ici_cond_rows = 0
     cond_cols = resolve_cols(cond_path, ["person_id", "condition_source_value"])
-    _first_chunk = True
+    first_chunk = True
+
     for chunk in pd.read_csv(
         cond_path,
         low_memory=False,
@@ -645,8 +798,7 @@ def main():
         n_cond_total += len(chunk)
         chunk.columns = [c.lower() for c in chunk.columns]
 
-        # Diagnostic on first chunk
-        if _first_chunk:
+        if first_chunk:
             print(
                 f"  [diag] cond person_id dtype={chunk.person_id.dtype}, "
                 f"sample={chunk.person_id.head(3).tolist()}"
@@ -659,44 +811,32 @@ def main():
                 f"  [diag] cond_source_value sample="
                 f"{chunk.condition_source_value.head(3).tolist()}"
             )
-            _first_chunk = False
+            first_chunk = False
 
-        # Ensure person_id is numeric (handles string/float from CSV)
-        chunk["person_id"] = pd.to_numeric(chunk["person_id"], errors="coerce")
-        chunk = chunk.dropna(subset=["person_id"])
-        chunk["person_id"] = chunk["person_id"].astype(int)
-
-        # Filter to ICI patients only
+        chunk = normalize_pid_column(chunk, "person_id")
         chunk = chunk[chunk.person_id.isin(ici_pids)]
         n_ici_cond_rows += len(chunk)
         if chunk.empty:
             continue
 
-        # INPC format: "1284^^H35.341" → extract ICD after "^^"
         raw = chunk.condition_source_value.astype(str)
         chunk["code"] = (
             raw.str.split("^^", regex=False)
-            .str[-1]  # take part after ^^
+            .str[-1]
             .str.upper()
             .str.replace(".", "", regex=False)
         )
 
-        # Vectorized cancer check (ICD-10 C-codes)
         is_cancer = chunk.code.apply(
-            lambda c: any(c.startswith(p) for p in CANCER_PREFIXES_10)
+            lambda c: any(c.startswith(p) for p in cancer_norm)
         )
-        cancer_pids.update(chunk.loc[is_cancer, "person_id"])
+        cancer_pids.update(int(p) for p in chunk.loc[is_cancer, "person_id"])
 
-        # Vectorized ESKD check
-        eskd_norm = [p.upper().replace(".", "") for p in ESKD_PREFIXES]
         is_eskd = chunk.code.apply(lambda c: any(c.startswith(p) for p in eskd_norm))
-        eskd_pids.update(chunk.loc[is_eskd, "person_id"])
+        eskd_pids.update(int(p) for p in chunk.loc[is_eskd, "person_id"])
 
-        # Store codes for NCI-CCI (step 4) — only ICI patients
         for pid, code in zip(chunk.person_id, chunk.code):
-            if pid not in patient_codes:
-                patient_codes[pid] = set()
-            patient_codes[pid].add(code)
+            patient_codes.setdefault(int(pid), set()).add(code)
 
     print(f"  Scanned {n_cond_total:,} condition rows")
     print(f"  ICI patient condition rows: {n_ici_cond_rows:,}")
@@ -704,10 +844,11 @@ def main():
     print(f"  ESKD patients: {len(eskd_pids & ici_pids):,}")
     print(f"  Mem: {mem_mb():.0f} MB")
 
-    # Apply filters
     valid_pids = (ici_pids & cancer_pids) - eskd_pids
     ici_index = ici_index[ici_index.person_id.isin(valid_pids)].copy()
     print(f"  After cancer + ESKD filter: {len(ici_index):,}")
+    if len(ici_index) == 0:
+        raise RuntimeError("No patients left after cancer + ESKD filter")
 
     # ══════════════════════════════════════════════════════════════
     # STEP 3: CREATININE → AKI PHENOTYPING (chunked measurement)
@@ -716,38 +857,19 @@ def main():
     print("STEP 3: Creatinine → AKI (chunked measurement scan)")
     print("=" * 70)
 
-    # Find creatinine concept IDs from concept table (small filtered read)
-    concept_path = f"{DATA}/r6335_concept.csv"
-    concept_cols = resolve_cols(
-        concept_path, ["concept_id", "concept_name", "vocabulary_id"], encoding="cp1252"
-    )
-    concept_cr = pd.read_csv(
-        concept_path,
-        encoding="cp1252",
-        low_memory=False,
-        usecols=concept_cols,
-    )
-    concept_cr.columns = [c.lower() for c in concept_cr.columns]
-    cr_mask = concept_cr.concept_name.str.contains(
-        "reatinine", case=False, na=False
-    ) & concept_cr.concept_name.str.contains(
-        "serum|blood|plasma|Creatinine in S", case=False, na=False
-    )
-    cr_concepts = set(int(c) for c in concept_cr.loc[cr_mask, "concept_id"].tolist())
-    # Add known LOINC concept for serum creatinine
-    cr_concepts.add(3016723)  # AoU/OMOP standard for LOINC 2160-0
-    del concept_cr
+    print("  Loading creatinine concept IDs from concept table...")
+    cr_concepts = load_creatinine_concepts(concept_path)
     gc.collect()
-    print(f"  Creatinine concept IDs: {len(cr_concepts)}")
+    print(f"  Creatinine concept IDs: {len(cr_concepts):,}")
 
     valid_pid_set = set(int(p) for p in ici_index.person_id)
     cr_rows = []
     n_meas_total = 0
-    meas_path = f"{DATA}/r6335_measurement.csv"
     meas_cols = resolve_cols(
         meas_path,
         ["person_id", "measurement_concept_id", "measurement_date", "value_as_number"],
     )
+
     for chunk in pd.read_csv(
         meas_path,
         low_memory=False,
@@ -757,7 +879,6 @@ def main():
         n_meas_total += len(chunk)
         chunk.columns = [c.lower() for c in chunk.columns]
 
-        # Diagnostic on first chunk
         if n_meas_total == len(chunk):
             print(
                 f"  [diag] meas person_id dtype={chunk.person_id.dtype}, "
@@ -768,16 +889,16 @@ def main():
                 f"{chunk.measurement_concept_id.dtype}"
             )
 
-        # Ensure person_id + concept_id are numeric
         chunk["person_id"] = pd.to_numeric(chunk["person_id"], errors="coerce")
         chunk["measurement_concept_id"] = pd.to_numeric(
             chunk["measurement_concept_id"], errors="coerce"
         )
         chunk = chunk.dropna(subset=["person_id", "measurement_concept_id"])
+        if chunk.empty:
+            continue
         chunk["person_id"] = chunk["person_id"].astype(int)
         chunk["measurement_concept_id"] = chunk["measurement_concept_id"].astype(int)
 
-        # Filter: ICI patients + creatinine concepts
         chunk = chunk[
             chunk.person_id.isin(valid_pid_set)
             & chunk.measurement_concept_id.isin(cr_concepts)
@@ -807,20 +928,39 @@ def main():
     cr = cr.dropna(subset=["value_as_number", "measurement_date"])
     cr = cr[(cr.value_as_number > 0.1) & (cr.value_as_number < 30)]
 
-    # Merge with ICI index date
     cr = cr.merge(ici_dates, on="person_id")
     cr["days"] = (cr.measurement_date - cr.ici_index_date).dt.days
 
-    # Baseline: median Cr in [-365d, -7d]
-    baseline = cr[(cr.days >= -365) & (cr.days <= -7)]
-    baseline_cr = (
-        baseline.groupby("person_id")["value_as_number"].median().rename("baseline_cr")
+    # baseline: median in [-365, -7]; fallback to most recent in [-365, -1]
+    baseline_main = cr[(cr.days >= -365) & (cr.days <= -7)]
+    baseline_main_cr = (
+        baseline_main.groupby("person_id")["value_as_number"]
+        .median()
+        .rename("baseline_cr")
+    )
+
+    baseline_fallback = cr[(cr.days >= -365) & (cr.days <= -1)].sort_values(
+        ["person_id", "days"]
+    )
+    baseline_fallback_cr = (
+        baseline_fallback.groupby("person_id")
+        .tail(1)
+        .set_index("person_id")["value_as_number"]
+        .rename("baseline_cr")
+    )
+
+    baseline_cr = baseline_main_cr.combine_first(baseline_fallback_cr).rename(
+        "baseline_cr"
+    )
+    fallback_only = baseline_cr.index.difference(baseline_main_cr.index)
+    print(
+        f"  Baseline Cr: main={len(baseline_main_cr):,}, "
+        f"fallback_only={len(fallback_only):,}, total={len(baseline_cr):,}"
     )
 
     cohort = ici_index.merge(baseline_cr, on="person_id", how="inner")
     print(f"  With baseline Cr: {len(cohort):,}")
 
-    # Follow-up Cr per window
     followup = cr[(cr.days >= 1) & (cr.days <= 365)]
     fu_with_base = followup.merge(
         cohort[["person_id", "baseline_cr"]],
@@ -837,16 +977,18 @@ def main():
         cohort[label] = (cohort[f"max_ratio_{label}"] >= CR_RATIO_THRESHOLD).astype(int)
         cohort.loc[cohort[f"max_ratio_{label}"].isna(), label] = 0
 
-    # Require at least one follow-up Cr
-    has_fu = set(followup.person_id)
+    has_fu = set(int(p) for p in followup.person_id)
     cohort = cohort[cohort.person_id.isin(has_fu)].copy()
-    # Exclude baseline Cr >= 4.0
     cohort = cohort[cohort.baseline_cr < 4.0].copy()
 
     del cr, followup, fu_with_base
     gc.collect()
 
     print(f"  Final cohort: {len(cohort):,}")
+    if len(cohort) == 0:
+        raise RuntimeError(
+            "Final cohort is empty after follow-up and baseline Cr filters"
+        )
     for label in AKI_WINDOWS:
         n = int(cohort[label].sum())
         print(f"    {label}: {n:,} events ({n/len(cohort)*100:.1f}%)")
@@ -859,8 +1001,8 @@ def main():
     print("STEP 4: Demographics + NCI-CCI + Nephrotoxins")
     print("=" * 70)
 
-    # Demographics from person table
-    person_path = f"{DATA}/r6335_person.csv"
+    cohort_pids = set(int(p) for p in cohort.person_id)
+
     person_cols = resolve_cols(
         person_path,
         [
@@ -877,9 +1019,11 @@ def main():
         usecols=person_cols,
     )
     person.columns = [c.lower() for c in person.columns]
-    person = person[person.person_id.isin(cohort.person_id)]
+    person = normalize_pid_column(person, "person_id")
+    person = person[person.person_id.isin(cohort_pids)]
 
     cohort = cohort.merge(person, on="person_id", how="left")
+    cohort["year_of_birth"] = pd.to_numeric(cohort["year_of_birth"], errors="coerce")
     cohort["age"] = cohort.ici_index_date.dt.year - cohort.year_of_birth
 
     sex_map = {8507: "Male", 8532: "Female"}
@@ -895,18 +1039,17 @@ def main():
     print(f"  Sex: {cohort.sex.value_counts().to_dict()}")
     print(f"  Race: {cohort.race.value_counts().to_dict()}")
 
-    # NCI-CCI (from pre-collected patient_codes dict)
-    cohort_pids = set(cohort.person_id)
     for condition, codes in NCI_CCI.items():
         all_pfx = codes.get("9", []) + codes.get("10", [])
         all_pfx_norm = [p.upper().replace(".", "") for p in all_pfx]
         pts_with = set()
         for pid in cohort_pids:
-            if pid in patient_codes:
-                for c in patient_codes[pid]:
-                    if any(c.startswith(p) for p in all_pfx_norm):
-                        pts_with.add(pid)
-                        break
+            if pid not in patient_codes:
+                continue
+            for c in patient_codes[pid]:
+                if any(c.startswith(p) for p in all_pfx_norm):
+                    pts_with.add(pid)
+                    break
         cohort[condition] = cohort.person_id.isin(pts_with).astype(int)
         print(
             f"    {condition:40s} {cohort[condition].sum():5,} "
@@ -920,7 +1063,7 @@ def main():
     del patient_codes
     gc.collect()
 
-    # Nephrotoxins (chunked drug scan, concomitant ±30d)
+    # nephrotoxins: concomitant +/-30d by drug_source_value keyword
     nephro_pids = set()
     for chunk in pd.read_csv(
         drug_path,
@@ -929,6 +1072,7 @@ def main():
         usecols=drug_cols,
     ):
         chunk.columns = [c.lower() for c in chunk.columns]
+        chunk = normalize_pid_column(chunk, "person_id")
         chunk = chunk[chunk.person_id.isin(cohort_pids)]
         if chunk.empty:
             continue
@@ -940,12 +1084,10 @@ def main():
         conco = chunk[(chunk.days >= -30) & (chunk.days <= 30)]
         if conco.empty:
             continue
-        is_nephro = (
-            conco.drug_source_value.astype(str)
-            .str.lower()
-            .apply(lambda x: any(kw in x for kw in NEPHROTOXIN_KW))
+        is_nephro = conco.drug_source_value.astype(str).str.contains(
+            NEPHROTOXIN_REGEX, case=False, regex=True, na=False
         )
-        nephro_pids.update(conco.loc[is_nephro, "person_id"])
+        nephro_pids.update(int(p) for p in conco.loc[is_nephro, "person_id"])
 
     cohort["nephrotoxin"] = cohort.person_id.isin(nephro_pids).astype(int)
     print(
@@ -965,29 +1107,24 @@ def main():
     feature_cols = []
     is_binary = []
 
-    # Age (standardized)
     age = cohort.age.values.astype(np.float64)
     age = ((age - np.nanmean(age)) / (np.nanstd(age) + 1e-8)).astype(np.float32)
     feature_names.append("age")
     feature_cols.append(age)
     is_binary.append(False)
 
-    # Sex (male=1)
     feature_names.append("sex_male")
     feature_cols.append((cohort.sex == "Male").values.astype(np.float32))
     is_binary.append(True)
 
-    # Race (Black=1)
     feature_names.append("race_black")
     feature_cols.append((cohort.race == "Black").values.astype(np.float32))
     is_binary.append(True)
 
-    # Ethnicity (Hispanic=1)
     feature_names.append("ethnicity_hispanic")
     feature_cols.append((cohort.ethnicity == "Hispanic").values.astype(np.float32))
     is_binary.append(True)
 
-    # NCI-CCI flags (drop low prevalence)
     dropped = []
     for cond in NCI_CCI:
         prev = cohort[cond].mean()
@@ -1002,30 +1139,25 @@ def main():
         for c, p in dropped:
             print(f"    {c}: {p*100:.2f}%")
 
-    # ICI class (3 binary)
     for c in ["ici_pd1", "ici_pdl1", "ici_ctla4"]:
         feature_names.append(c)
         feature_cols.append(cohort[c].values.astype(np.float32))
         is_binary.append(True)
 
-    # Nephrotoxin
     feature_names.append("nephrotoxin")
     feature_cols.append(cohort.nephrotoxin.values.astype(np.float32))
     is_binary.append(True)
 
-    # NCI-CCI score (standardized)
     score = cohort.nci_cci_score.values.astype(np.float64)
     score = ((score - np.nanmean(score)) / (np.nanstd(score) + 1e-8)).astype(np.float32)
     feature_names.append("nci_cci_score")
     feature_cols.append(score)
     is_binary.append(False)
 
-    # AKI outcome node (last)
     feature_names.append("aki_event")
     feature_cols.append(cohort[PRIMARY_WINDOW].values.astype(np.float32))
     is_binary.append(True)
 
-    # Assemble
     X = np.stack(feature_cols, axis=0)
     X = np.nan_to_num(X, nan=0.0)
     feature_matrix = torch.tensor(X, dtype=torch.float32)
@@ -1042,7 +1174,6 @@ def main():
         else:
             print(f"    [{i:2d}] {name:40s} ({tag})  μ={v.mean():.3f} σ={v.std():.3f}")
 
-    # Save
     torch.save(feature_matrix, os.path.join(OUT, "feature_matrix.pt"))
     torch.save(binary_mask, os.path.join(OUT, "binary_mask.pt"))
     with open(os.path.join(OUT, "feature_names.json"), "w") as f:
