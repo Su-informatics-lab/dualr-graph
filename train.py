@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-05_train.py — Training loop for Graph Transformer AE.
+train.py — Training loop for Graph Transformer AE.
 
 Handles:
   - Semi-supervised loss (reconstruction + λ·CE on AKI node)
@@ -9,14 +9,17 @@ Handles:
   - W&B logging
   - Graph rebuilding per fold (from training patients only)
 
+FIX (2026-05-16): The model sees ALL patients at once (transductive).
+Train/test split is over patient *indices* (columns), not separate tensors.
+in_channels = N (full cohort), constant across folds.
+
 Usage:
-    # Single run (for debugging)
-    python 05_train.py --arch transformer --edge_method spearman --k 8 \
+    python train.py --arch transformer --edge_method spearman --k 8 \
         --hidden 64 --latent 16 --heads 4 --lr 1e-3 --lambda_ce 1.0 \
         --epochs 300 --cv_folds 5
 
     # With W&B
-    python 05_train.py --arch transformer --edge_method spearman --k 8 \
+    python train.py --arch transformer --edge_method spearman --k 8 \
         --hidden 64 --latent 16 --wandb
 """
 
@@ -35,22 +38,24 @@ from models import build_model
 # ── Loss function ─────────────────────────────────────────────────
 
 
-def compute_loss(x, x_recon, aki_idx, y_aki, lam=1.0, binary_mask=None):
+def compute_loss(x, x_recon, aki_idx, y_aki, train_idx, lam=1.0, binary_mask=None):
     """
-    Semi-supervised loss: reconstruction + λ·CE on AKI node.
+    Semi-supervised loss: reconstruction (all patients) + λ·CE on AKI node
+    (training patients only).
 
     Args:
-        x:           [F, N] original feature matrix
-        x_recon:     [F, N] reconstructed
+        x:           [F, N] original feature matrix (ALL patients)
+        x_recon:     [F, N] reconstructed (ALL patients)
         aki_idx:     int, index of AKI node
-        y_aki:       [N] ground truth (0/1, NaN for unlabeled)
+        y_aki:       [N] ground truth (0/1)
+        train_idx:   array of int, training patient indices for CE
         lam:         CE weight
         binary_mask: [F] bool, True for binary nodes (BCE), False (MSE)
 
     Returns:
         total_loss, recon_loss, ce_loss
     """
-    # Reconstruction loss
+    # Reconstruction loss — ALL patients (semi-supervised signal)
     if binary_mask is not None:
         cont = ~binary_mask
         n_cont = cont.sum().item()
@@ -67,15 +72,11 @@ def compute_loss(x, x_recon, aki_idx, y_aki, lam=1.0, binary_mask=None):
     else:
         recon_loss = F.mse_loss(x_recon, x)
 
-    # CE loss on AKI node (only labeled patients)
-    aki_logits = x_recon[aki_idx]
-    labeled = ~torch.isnan(y_aki)
-    if labeled.sum() == 0:
-        ce_loss = torch.tensor(0.0, device=x.device)
-    else:
-        ce_loss = F.binary_cross_entropy_with_logits(
-            aki_logits[labeled], y_aki[labeled]
-        )
+    # CE loss on AKI node — TRAINING patients only
+    aki_logits = x_recon[aki_idx]  # [N]
+    ce_loss = F.binary_cross_entropy_with_logits(
+        aki_logits[train_idx], y_aki[train_idx]
+    )
 
     total = recon_loss + lam * ce_loss
     return total, recon_loss, ce_loss
@@ -84,16 +85,16 @@ def compute_loss(x, x_recon, aki_idx, y_aki, lam=1.0, binary_mask=None):
 # ── Evaluation ────────────────────────────────────────────────────
 
 
-def evaluate(model, x, edge_index, aki_idx, y_true):
-    """Compute AUROC, AUPRC, Brier on a held-out set."""
+def evaluate(model, x, edge_index, aki_idx, y_all, test_idx):
+    """Compute AUROC, AUPRC, Brier on held-out patient indices."""
     model.eval()
     with torch.no_grad():
         x_recon, _ = model(x, edge_index)
         probs = torch.sigmoid(x_recon[aki_idx]).cpu().numpy()
 
-    y = y_true.cpu().numpy()
-    valid = ~np.isnan(y)
-    y_v, p_v = y[valid], probs[valid]
+    y = y_all.cpu().numpy()
+    y_v = y[test_idx]
+    p_v = probs[test_idx]
 
     if len(np.unique(y_v)) < 2:
         return {"auroc": float("nan"), "auprc": float("nan"), "brier": float("nan")}
@@ -110,19 +111,19 @@ def evaluate(model, x, edge_index, aki_idx, y_true):
 
 def train_one_fold(
     model,
-    x_train,
-    x_test,
+    x_full,
     edge_index,
     aki_idx,
-    y_train,
-    y_test,
+    y_all,
+    train_idx,
+    test_idx,
     binary_mask,
     config,
     fold_idx=0,
     wandb_run=None,
 ):
     """Train one fold, return best metrics dict."""
-    device = x_train.device
+    device = x_full.device
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config["lr"],
@@ -139,13 +140,14 @@ def train_one_fold(
 
     for epoch in range(config["epochs"]):
         model.train()
-        x_recon, z = model(x_train, edge_index)
+        x_recon, z = model(x_full, edge_index)
 
         loss, recon_l, ce_l = compute_loss(
-            x_train,
+            x_full,
             x_recon,
             aki_idx,
-            y_train,
+            y_all,
+            train_idx,
             lam=config["lambda_ce"],
             binary_mask=binary_mask,
         )
@@ -160,7 +162,7 @@ def train_one_fold(
 
         # Evaluate periodically
         if epoch % config.get("eval_every", 10) == 0:
-            metrics = evaluate(model, x_test, edge_index, aki_idx, y_test)
+            metrics = evaluate(model, x_full, edge_index, aki_idx, y_all, test_idx)
 
             if wandb_run is not None:
                 wandb_run.log(
@@ -215,42 +217,42 @@ def run_cv(config, data_dir="data", wandb_run=None):
 
     F_nodes, N = X.shape
     aki_idx = feature_names.index("aki_event")
-    y_all = X[aki_idx].numpy()
+    y_all_np = X[aki_idx].numpy()
+
+    # ── Move full data to device ONCE ──
+    X_full = X.to(device)
+    y_all = torch.tensor(y_all_np, dtype=torch.float32, device=device)
+    bm = binary_mask.to(device)
 
     print(f"  Data: {F_nodes} nodes × {N} patients")
-    print(f"  AKI prevalence: {y_all.mean():.3f}")
+    print(f"  AKI prevalence: {y_all_np.mean():.3f}")
     print(f"  Architecture: {config['arch']}")
     print(f"  Edge method: {config['edge_method']}, k={config['k']}")
+    print(f"  in_channels (fixed): {N}")
 
     skf = StratifiedKFold(n_splits=config["cv_folds"], shuffle=True, random_state=42)
     fold_metrics = []
 
-    for fold, (train_idx, test_idx) in enumerate(skf.split(np.zeros(N), y_all)):
+    for fold, (train_idx, test_idx) in enumerate(skf.split(np.zeros(N), y_all_np)):
         print(f"\n  ── Fold {fold+1}/{config['cv_folds']} ──")
+        print(f"    Train: {len(train_idx)} patients, Test: {len(test_idx)} patients")
 
-        # Split patient columns
-        x_train = X[:, train_idx].to(device)
-        x_test = X[:, test_idx].to(device)
-        y_train = torch.tensor(y_all[train_idx], dtype=torch.float32, device=device)
-        y_test = torch.tensor(y_all[test_idx], dtype=torch.float32, device=device)
-
-        # Build graph from training fold ONLY
-        X_train_np = x_train.cpu().numpy().T  # [N_train, F]
+        # Build graph from training fold ONLY (no leakage)
+        X_train_np = X[:, train_idx].cpu().numpy().T  # [N_train, F]
         if config["edge_method"] == "spearman":
             adj = build_spearman(X_train_np)
         elif config["edge_method"] == "mi":
             adj = build_mi(X_train_np)
         else:
-            # For LLM edges: load precomputed, no data leakage issue
+            # LLM edges: precomputed, no data leakage issue
             adj = np.load(os.path.join(data_dir, f"adj_{config['edge_method']}.npy"))
 
         edge_index = knn_sparsify(adj, k=config["k"]).to(device)
-        bm = binary_mask.to(device)
 
-        # Build model
+        # Build model — in_channels = N (full cohort), same every fold
         model = build_model(
             arch=config["arch"],
-            in_channels=x_train.shape[1],  # N_train
+            in_channels=N,
             hidden=config["hidden"],
             latent=config["latent"],
             heads=config.get("heads", 4),
@@ -259,12 +261,12 @@ def run_cv(config, data_dir="data", wandb_run=None):
 
         metrics = train_one_fold(
             model,
-            x_train,
-            x_test,
+            X_full,
             edge_index,
             aki_idx,
-            y_train,
-            y_test,
+            y_all,
+            train_idx,
+            test_idx,
             bm,
             config,
             fold_idx=fold,
