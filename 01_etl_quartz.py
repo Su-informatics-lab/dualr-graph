@@ -6,10 +6,11 @@ Runs on Quartz (~70 GB RAM, 7 threads). Reads the purpose-built INPC
 OMOP CSV dump for post-ICI patients, produces feature tensors for SCP
 to Tempest.
 
-AKI definition (v2, per Dr. Su 2026-05-17):
-  Cr ≥ 2.0× baseline within 365d of first ICI
+AKI definition (v3, per Dr. Su 2026-05-17):
+  Cr ≥ 1.5× baseline within 365d of first ICI  (KDIGO Stage 1+)
   OR  AKI ICD (N17.x / 584.x) during a severe visit (IP/ER/Urgent Care)
       — "Allison's definition" per Gatz/Su JAMIA ocae256
+      — Exclude patients with AKI ICD in 90d pre-ICI (pre-existing AKI)
 
 Survival data:
   evt=1  → surv_days = earliest AKI event − ICI index date
@@ -61,7 +62,7 @@ os.makedirs(FIG, exist_ok=True)
 
 CHUNK = 500_000  # rows per chunk for large csvs
 MIN_PREVALENCE = 0.01
-CR_RATIO_THRESHOLD = 2.0  # Cr ≥ 2.0× baseline
+CR_RATIO_THRESHOLD = 1.5  # Cr ≥ 1.5× baseline (KDIGO Stage 1+, per Su 2026-05-17)
 
 AKI_WINDOWS = {"aki_3m": 90, "aki_6m": 180, "aki_12m": 365}
 PRIMARY_WINDOW = "aki_12m"
@@ -697,7 +698,7 @@ def concept_id_series(chunk, col):
 def main():
     print("=" * 70)
     print("GRAPH AI — INPC ETL (Quartz, memory-safe)")
-    print("  AKI def: Cr ≥2.0× OR (AKI ICD + severe visit)")
+    print("  AKI def: Cr ≥1.5× (KDIGO 1+) OR (AKI ICD + severe visit, no pre-ICI AKI)")
     print("=" * 70)
     print(f"  Data:   {DATA}")
     print(f"  Output: {OUT}/")
@@ -1155,6 +1156,15 @@ def main():
         aki_icd["condition_date"] = parse_date(aki_icd.condition_start_date)
         aki_icd = aki_icd.merge(cohort[["person_id", "ici_index_date"]], on="person_id")
         aki_icd["days"] = (aki_icd.condition_date - aki_icd.ici_index_date).dt.days
+
+        # Exclude patients with AKI ICD in 90d pre-ICI (pre-existing AKI)
+        pre_ici_aki = aki_icd[(aki_icd.days >= -90) & (aki_icd.days <= 0)]
+        pre_existing_pts = set(pre_ici_aki.person_id.unique())
+        n_pre = len(pre_existing_pts)
+        print(f"  Patients with AKI ICD in 90d pre-ICI (excluded): {n_pre:,}")
+        aki_icd = aki_icd[~aki_icd.person_id.isin(pre_existing_pts)]
+
+        # Now filter to post-ICI window
         aki_icd = aki_icd[(aki_icd.days >= 1) & (aki_icd.days <= 365)]
 
         # Earliest ICD event per patient
