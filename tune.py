@@ -16,9 +16,6 @@ import os
 
 import optuna
 
-# Import will be resolved at runtime
-# from 05_train import run_cv
-
 
 def create_objective(args):
     """Factory: returns an Optuna objective function."""
@@ -147,7 +144,6 @@ def main():
 
 
 if __name__ == "__main__":
-    # Runtime import resolution for numbered modules
-    train_mod = __import__("05_train")
+    train_mod = __import__("train")
     run_cv = train_mod.run_cv
     main()
