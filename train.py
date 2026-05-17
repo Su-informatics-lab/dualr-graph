@@ -23,14 +23,14 @@ Usage:
 import argparse
 import json
 import os
-import sys
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from _03_models import build_model  # renamed import to avoid collision
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
+
+from models import build_model
 
 # ── Loss function ─────────────────────────────────────────────────
 
@@ -364,15 +364,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Handle import names: allow both direct run and import
-    sys.modules["_03_models"] = (
-        __import__("03_models")
-        if "03_models" not in sys.modules
-        else sys.modules["03_models"]
-    )
-    sys.modules["_02_graph"] = (
-        __import__("02_graph")
-        if "02_graph" not in sys.modules
-        else sys.modules["02_graph"]
-    )
     main()
