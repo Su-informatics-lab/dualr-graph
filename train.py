@@ -215,9 +215,14 @@ def run_cv(config, data_dir="data", wandb_run=None):
     aki_idx = feature_names.index("aki_event")
     y_all = X[aki_idx].numpy()
 
+    # Missing mask
+    miss_path = os.path.join(data_dir, "missing_mask.pt")
+    missing_mask = None
+    if os.path.exists(miss_path):
+        missing_mask = torch.load(miss_path, weights_only=True).to(device)
+        print(f"  Missing mask: {missing_mask.sum().item()} entries")
+
     # ── 6-month landmark filtering ────────────────────────────
-    # Exclude patients with follow-up < 180d and no event
-    # (same filter as analysis.py to match LogReg baseline)
     meta = pd.read_csv(os.path.join(data_dir, "cohort_meta.csv"))
     surv_days = meta["surv_days"].values
     has_event = y_all == 1
@@ -228,21 +233,12 @@ def run_cv(config, data_dir="data", wandb_run=None):
     X = X[:, eligible_idx]
     y_all = y_all[eligible_idx]
     N = len(eligible_idx)
+    if missing_mask is not None:
+        missing_mask = missing_mask[:, eligible_idx]
     print(
         f"  6-month landmark: {eligible.sum()}/{len(eligible)} eligible "
         f"(excluded {(~eligible).sum()} early-censored)"
     )
-
-    # Update missing mask
-    if missing_mask is not None:
-        missing_mask = missing_mask[:, eligible_idx]
-
-    # Missing mask
-    miss_path = os.path.join(data_dir, "missing_mask.pt")
-    missing_mask = None
-    if os.path.exists(miss_path):
-        missing_mask = torch.load(miss_path, weights_only=True).to(device)
-        print(f"  Missing mask: {missing_mask.sum().item()} entries")
 
     # Edge weights
     use_ew = config.get("use_edge_weights", False)
