@@ -296,6 +296,7 @@ def compute_loss(
     lambda_rec,
     pseudo_weight,
     pos_weight,
+    aki_weight=1.0,
 ):
     device = out.x_hat.device
     idx = torch.as_tensor(batch_idx, dtype=torch.long, device=device)
@@ -325,7 +326,7 @@ def compute_loss(
     else:
         aki_loss = torch.tensor(0.0, device=device)
 
-    loss = lambda_rec * rec_loss + aki_loss
+    loss = lambda_rec * rec_loss + aki_weight * aki_loss
     return loss, {"rec": float(rec_loss.detach()), "aki": float(aki_loss.detach())}
 
 
@@ -438,7 +439,7 @@ def train_one_fold(
         dropout=config["dropout"],
         edge_dim=edge_dim,
         conv_type=config["conv_type"],
-        use_recon_aki=config["use_recon_aki"],
+        aki_mode=config["aki_mode"],
         add_self_loops=config["add_self_loops"],
     ).to(device)
 
@@ -493,6 +494,7 @@ def train_one_fold(
                 config["lambda_rec"],
                 config["pseudo_weight"],
                 pos_weight,
+                config.get("aki_weight", 1.0),
             )
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Non-finite loss fold={fold} epoch={epoch}")
@@ -673,10 +675,20 @@ def run_cv(config):
     missing_nf = missing_fn.T.contiguous()
 
     recon_mode = "transductive" if not config["strict_recon"] else "strict"
-    aki_mode = "recon" if config["use_recon_aki"] else "separate_head"
+
+    # For reweight mode: use "recon" architecture but scale ℒ_AKI
+    effective_aki_mode = config["aki_mode"]
+    if effective_aki_mode == "reweight":
+        config["aki_mode"] = "recon"  # same architecture as pure recon
+        if config.get("aki_weight", 1.0) <= 1.0:
+            # Auto-compute: balance gradient ratio
+            config["aki_weight"] = 58.0
+            print(
+                f"  Auto-set aki_weight={config['aki_weight']:.0f} (gradient balance)"
+            )
 
     print("=" * 72)
-    print("Feature-graph AE:  L = λ·L_rec + L_AKI")
+    print("Feature-graph AE:  L = λ·L_rec + α·L_AKI")
     print("=" * 72)
     print(f"Device: {device}")
     print(f"Data: N={X_nf.shape[0]}, F={X_nf.shape[1]}, AKI rate={y_all.mean():.3f}")
@@ -688,10 +700,11 @@ def run_cv(config):
         f"conv={config['conv_type']} L={config['layers']} self_loops={config['add_self_loops']}"
     )
     print(
-        f"Loss: λ_rec={config['lambda_rec']} mask={config['mask_rate']} pseudo={config['pseudo_weight']}"
+        f"Loss: λ_rec={config['lambda_rec']} α_aki={config.get('aki_weight', 1.0)} "
+        f"mask={config['mask_rate']} pseudo={config['pseudo_weight']}"
     )
     print(
-        f"Mode: recon={recon_mode} aki={aki_mode} label_input={config['use_label_input']}"
+        f"Mode: recon={recon_mode} aki={effective_aki_mode} label_input={config['use_label_input']}"
     )
 
     # ── W&B ───────────────────────────────────────────────────
@@ -854,11 +867,18 @@ def parse_args():
 
     # AKI prediction mode
     p.add_argument(
-        "--separate_aki_head",
-        dest="use_recon_aki",
-        action="store_false",
-        default=True,
-        help="Ablation: use separate MLP head instead of AKI node reconstruction",
+        "--aki_mode",
+        default="recon_split",
+        choices=["recon", "recon_split", "dual", "reweight"],
+        help="recon=shared head, recon_split=separate AKI Linear, "
+        "dual=encoder MLP head, reweight=recon + scaled ℒ_AKI",
+    )
+    p.add_argument(
+        "--aki_weight",
+        type=float,
+        default=1.0,
+        help="Multiplier on ℒ_AKI (used with --aki_mode=reweight, "
+        "set to ~58 to balance gradient ratio)",
     )
 
     # Loss

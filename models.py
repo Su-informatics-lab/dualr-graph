@@ -179,16 +179,17 @@ class FeatureGraphAE(nn.Module):
     """
     Patient-as-graph-signal feature-graph autoencoder.
 
-    Default: AKI prediction = sigma(x_hat[:, aki_idx])  (reconstruction).
-    Ablation: AKI prediction = MLP(z_aki, z_pool)       (separate head).
+    AKI prediction modes (--aki_mode):
+      recon       : P(AKI) = σ(x̂[:, K])        shared recon_head (original)
+      recon_split : P(AKI) = σ(Linear_aki(dK))  AKI gets its own output head
+      dual        : P(AKI) = σ(MLP(zK, z̄))      encoder-based head, recon regularizes
 
     Parameters
     ----------
     num_features : K feature nodes including AKI
     aki_idx      : column index of AKI in the feature matrix
     layers       : GNN depth, 2 or 3
-    use_recon_aki: True = AKI logit from decoder reconstruction (whiteboard)
-                   False = AKI logit from separate MLP head (ablation)
+    aki_mode     : "recon" | "recon_split" | "dual"
     """
 
     def __init__(
@@ -203,16 +204,18 @@ class FeatureGraphAE(nn.Module):
         dropout: float = 0.15,
         edge_dim: Optional[int] = 1,
         conv_type: str = "gatv2",
-        use_recon_aki: bool = True,
+        aki_mode: str = "recon_split",
         add_self_loops: bool = True,
     ) -> None:
         super().__init__()
         if layers not in (2, 3):
             raise ValueError("layers must be 2 or 3")
+        if aki_mode not in ("recon", "recon_split", "dual"):
+            raise ValueError(f"aki_mode must be recon/recon_split/dual, got {aki_mode}")
 
         self.num_features = int(num_features)
         self.aki_idx = int(aki_idx)
-        self.use_recon_aki = use_recon_aki
+        self.aki_mode = aki_mode
         self.node_emb = nn.Embedding(num_features, node_emb_dim)
 
         # Node input = value(1) + missing_flag(1) + aki_flag(1) + emb
@@ -262,9 +265,13 @@ class FeatureGraphAE(nn.Module):
             edge_dim=edge_dim,
             add_self_loops=add_self_loops,
         )
+        # Shared reconstruction head (non-AKI features, or all if mode=recon)
         self.recon_head = nn.Linear(hidden, 1)
 
-        # ── Separate AKI head (ablation only) ────────────────────
+        # ── Mode A: separate AKI reconstruction head ─────────────
+        self.aki_recon_head = nn.Linear(hidden, 1)
+
+        # ── Mode B: encoder-based AKI head ───────────────────────
         self.aki_head = nn.Sequential(
             nn.Linear(latent * 2, hidden),
             nn.ELU(),
@@ -316,14 +323,25 @@ class FeatureGraphAE(nn.Module):
         # Decode (GNN decoder → scalar per node)
         d = self.dec1(h, edge_index_b, edge_attr_b)
         d = self.dec2(d, edge_index_b, edge_attr_b)
+        d_nodes = d.view(batch_size, num_features, -1)  # [B, F, hidden]
+
+        # Reconstruction for non-AKI features (always uses recon_head)
         x_hat = self.recon_head(d).view(batch_size, num_features)
 
-        # ── AKI logit ────────────────────────────────────────────
-        if self.use_recon_aki:
-            # Whiteboard design: AKI prediction IS the reconstruction
+        # ── AKI logit (depends on mode) ──────────────────────────
+        if self.aki_mode == "recon":
+            # Original: AKI logit = shared recon_head output
             aki_logits = x_hat[:, self.aki_idx]
-        else:
-            # Ablation: separate MLP head
+
+        elif self.aki_mode == "recon_split":
+            # (A) AKI gets its own Linear on the same decoder embedding dK
+            aki_logits = self.aki_recon_head(d_nodes[:, self.aki_idx, :]).squeeze(-1)
+            # Overwrite x_hat's AKI column so compute_loss sees the right logit
+            x_hat = x_hat.clone()
+            x_hat[:, self.aki_idx] = aki_logits
+
+        elif self.aki_mode == "dual":
+            # (B) Encoder-based MLP head; reconstruction is regularizer only
             z_aki = z[:, self.aki_idx, :]
             z_pool = z.mean(dim=1)
             aki_logits = self.aki_head(torch.cat([z_aki, z_pool], dim=-1)).squeeze(-1)
@@ -355,7 +373,7 @@ def build_model(
     dropout: float = 0.15,
     edge_dim: Optional[int] = 1,
     conv_type: str = "gatv2",
-    use_recon_aki: bool = True,
+    aki_mode: str = "recon_split",
     add_self_loops: bool = True,
     **_: Dict,
 ) -> FeatureGraphAE:
@@ -370,6 +388,6 @@ def build_model(
         dropout=dropout,
         edge_dim=edge_dim,
         conv_type=conv_type,
-        use_recon_aki=use_recon_aki,
+        aki_mode=aki_mode,
         add_self_loops=add_self_loops,
     )
