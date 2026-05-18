@@ -681,7 +681,6 @@ def run_cv(config):
     if effective_aki_mode == "reweight":
         config["aki_mode"] = "recon"  # same architecture as pure recon
         if config.get("aki_weight", 1.0) <= 1.0:
-            # Auto-compute: balance gradient ratio
             config["aki_weight"] = 58.0
             print(
                 f"  Auto-set aki_weight={config['aki_weight']:.0f} (gradient balance)"
@@ -709,14 +708,17 @@ def run_cv(config):
 
     # ── W&B ───────────────────────────────────────────────────
     if config.get("wandb") and HAS_WANDB:
-        run_name = (
-            config.get("run_name")
-            or f"gae_{config['edge_method']}_l{config['layers']}_lam{config['lambda_rec']:g}"
+        run_name = config.get("run_name") or (
+            f"gae_{config['edge_method']}_{effective_aki_mode}"
+            f"_l{config['layers']}_lam{config['lambda_rec']:g}"
         )
+        # Log original aki_mode (not the rewritten one)
+        wb_config = {**config, "aki_mode": effective_aki_mode}
         wandb.init(
             project=config.get("wandb_project", "dualr-graph"),
             name=run_name,
-            config=config,
+            config=wb_config,
+            tags=[effective_aki_mode, config["edge_method"], config["conv_type"]],
             reinit=True,
         )
 
@@ -775,6 +777,7 @@ def run_cv(config):
     has_xgb = np.any(np.isfinite(xgb_aurocs))
 
     summary = {
+        "aki_mode": effective_aki_mode,
         "auroc_mean": float(np.nanmean(aurocs)),
         "auroc_std": float(np.nanstd(aurocs)),
         "auprc_mean": float(np.nanmean(auprcs)),
@@ -783,7 +786,7 @@ def run_cv(config):
         "logreg_auroc_std": float(np.nanstd(lr_aurocs)),
         "delta_vs_logreg": float(np.nanmean(aurocs - lr_aurocs)),
         "folds": fold_metrics,
-        "config": config,
+        "config": {**config, "aki_mode": effective_aki_mode},
     }
     if has_xgb:
         summary["xgb_auroc_mean"] = float(np.nanmean(xgb_aurocs))
