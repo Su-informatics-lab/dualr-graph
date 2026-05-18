@@ -66,7 +66,7 @@ g.ax_heatmap.tick_params(axis="y", labelsize=7)
 
 plt.suptitle(
     "LLM-estimated clinical feature associations\n"
-    "Directed P(a|b) from GPT-4o (10 reps, symmetrized for clustering)",
+    "Directed P(a|b) from Llama3.1-8b-instruct (10 reps, symmetrized for clustering)",
     y=1.02,
     fontsize=11,
     fontweight="bold",
