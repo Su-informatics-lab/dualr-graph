@@ -759,6 +759,7 @@ def run_cv(config):
     xgb_aurocs = np.array(
         [m.get("xgb_auroc", float("nan")) for m in fold_metrics], dtype=float
     )
+    has_xgb = np.any(np.isfinite(xgb_aurocs))
 
     summary = {
         "auroc_mean": float(np.nanmean(aurocs)),
@@ -767,13 +768,14 @@ def run_cv(config):
         "auprc_std": float(np.nanstd(auprcs)),
         "logreg_auroc_mean": float(np.nanmean(lr_aurocs)),
         "logreg_auroc_std": float(np.nanstd(lr_aurocs)),
-        "xgb_auroc_mean": float(np.nanmean(xgb_aurocs)),
-        "xgb_auroc_std": float(np.nanstd(xgb_aurocs)),
         "delta_vs_logreg": float(np.nanmean(aurocs - lr_aurocs)),
-        "delta_vs_xgb": float(np.nanmean(aurocs - xgb_aurocs)),
         "folds": fold_metrics,
         "config": config,
     }
+    if has_xgb:
+        summary["xgb_auroc_mean"] = float(np.nanmean(xgb_aurocs))
+        summary["xgb_auroc_std"] = float(np.nanstd(xgb_aurocs))
+        summary["delta_vs_xgb"] = float(np.nanmean(aurocs - xgb_aurocs))
 
     print(f"\n{'='*72}")
     print(f"GNN  AUROC: {summary['auroc_mean']:.4f} ± {summary['auroc_std']:.4f}")
@@ -781,26 +783,29 @@ def run_cv(config):
     print(
         f"LR   AUROC: {summary['logreg_auroc_mean']:.4f} ± {summary['logreg_auroc_std']:.4f}"
     )
-    print(
-        f"XGB  AUROC: {summary['xgb_auroc_mean']:.4f} ± {summary['xgb_auroc_std']:.4f}"
-    )
+    if has_xgb:
+        print(
+            f"XGB  AUROC: {summary['xgb_auroc_mean']:.4f} ± {summary['xgb_auroc_std']:.4f}"
+        )
     print(f"Δ vs LR:    {summary['delta_vs_logreg']:+.4f}")
-    print(f"Δ vs XGB:   {summary['delta_vs_xgb']:+.4f}")
+    if has_xgb:
+        print(f"Δ vs XGB:   {summary['delta_vs_xgb']:+.4f}")
     print(f"{'='*72}")
 
     if config.get("wandb") and HAS_WANDB:
-        wandb.summary.update(
-            {
-                "auroc_mean": summary["auroc_mean"],
-                "auroc_std": summary["auroc_std"],
-                "auprc_mean": summary["auprc_mean"],
-                "auprc_std": summary["auprc_std"],
-                "logreg_auroc_mean": summary["logreg_auroc_mean"],
-                "xgb_auroc_mean": summary["xgb_auroc_mean"],
-                "delta_vs_logreg": summary["delta_vs_logreg"],
-                "delta_vs_xgb": summary["delta_vs_xgb"],
-            }
-        )
+        wb_summary = {
+            "auroc_mean": summary["auroc_mean"],
+            "auroc_std": summary["auroc_std"],
+            "auprc_mean": summary["auprc_mean"],
+            "auprc_std": summary["auprc_std"],
+            "logreg_auroc_mean": summary["logreg_auroc_mean"],
+            "delta_vs_logreg": summary["delta_vs_logreg"],
+        }
+        if has_xgb:
+            wb_summary["xgb_auroc_mean"] = summary["xgb_auroc_mean"]
+            wb_summary["delta_vs_xgb"] = summary["delta_vs_xgb"]
+        wandb.summary.update(wb_summary)
+
         cols = ["fold", "auroc", "auprc", "logreg_auroc", "xgb_auroc", "best_epoch"]
         table = wandb.Table(columns=cols)
         for m in fold_metrics:
