@@ -575,17 +575,42 @@ def train_one_fold(
     test_auc = safe_auroc(y_test, test_prob)
     test_auprc = safe_auprc(y_test, test_prob)
 
-    # Same-fold LogReg sanity check
+    # Same-fold baselines (exact same preprocessing)
     non_aki = [i for i in range(num_features) if i != aki_idx]
-    X_lr = fold_data.x_filled[:, non_aki].cpu().numpy()
+    X_bl = fold_data.x_filled[:, non_aki].cpu().numpy()
     y_np = fold_data.y.cpu().numpy()
+
+    # LogReg
     lr = LogisticRegression(
         max_iter=5000, class_weight="balanced", C=config["logreg_C"]
     )
-    lr.fit(X_lr[train_idx], y_np[train_idx])
-    lr_prob = lr.predict_proba(X_lr[test_idx])[:, 1]
+    lr.fit(X_bl[train_idx], y_np[train_idx])
+    lr_prob = lr.predict_proba(X_bl[test_idx])[:, 1]
     lr_auc = safe_auroc(y_np[test_idx], lr_prob)
     lr_auprc = safe_auprc(y_np[test_idx], lr_prob)
+
+    # XGBoost
+    xgb_auc, xgb_auprc = float("nan"), float("nan")
+    try:
+        from xgboost import XGBClassifier
+
+        n_pos_np = y_np[train_idx].sum()
+        n_neg_np = len(train_idx) - n_pos_np
+        xgb = XGBClassifier(
+            n_estimators=200,
+            max_depth=4,
+            learning_rate=0.1,
+            scale_pos_weight=max(1, n_neg_np / max(1, n_pos_np)),
+            eval_metric="logloss",
+            verbosity=0,
+            random_state=config["seed"],
+        )
+        xgb.fit(X_bl[train_idx], y_np[train_idx])
+        xgb_prob = xgb.predict_proba(X_bl[test_idx])[:, 1]
+        xgb_auc = safe_auroc(y_np[test_idx], xgb_prob)
+        xgb_auprc = safe_auprc(y_np[test_idx], xgb_prob)
+    except ImportError:
+        pass
 
     return {
         "fold": fold,
@@ -595,6 +620,8 @@ def train_one_fold(
         "best_epoch": int(best_epoch),
         "logreg_auroc": lr_auc,
         "logreg_auprc": lr_auprc,
+        "xgb_auroc": xgb_auc,
+        "xgb_auprc": xgb_auprc,
         "n_train": len(train_idx),
         "n_val": len(val_idx),
         "n_test": len(test_idx),
@@ -721,10 +748,17 @@ def run_cv(config):
         print(
             f"  LR   AUROC={metrics['logreg_auroc']:.4f}  AUPRC={metrics['logreg_auprc']:.4f}"
         )
+        if np.isfinite(metrics.get("xgb_auroc", float("nan"))):
+            print(
+                f"  XGB  AUROC={metrics['xgb_auroc']:.4f}  AUPRC={metrics['xgb_auprc']:.4f}"
+            )
 
     aurocs = np.array([m["auroc"] for m in fold_metrics], dtype=float)
     auprcs = np.array([m["auprc"] for m in fold_metrics], dtype=float)
     lr_aurocs = np.array([m["logreg_auroc"] for m in fold_metrics], dtype=float)
+    xgb_aurocs = np.array(
+        [m.get("xgb_auroc", float("nan")) for m in fold_metrics], dtype=float
+    )
 
     summary = {
         "auroc_mean": float(np.nanmean(aurocs)),
@@ -733,7 +767,10 @@ def run_cv(config):
         "auprc_std": float(np.nanstd(auprcs)),
         "logreg_auroc_mean": float(np.nanmean(lr_aurocs)),
         "logreg_auroc_std": float(np.nanstd(lr_aurocs)),
+        "xgb_auroc_mean": float(np.nanmean(xgb_aurocs)),
+        "xgb_auroc_std": float(np.nanstd(xgb_aurocs)),
         "delta_vs_logreg": float(np.nanmean(aurocs - lr_aurocs)),
+        "delta_vs_xgb": float(np.nanmean(aurocs - xgb_aurocs)),
         "folds": fold_metrics,
         "config": config,
     }
@@ -744,7 +781,11 @@ def run_cv(config):
     print(
         f"LR   AUROC: {summary['logreg_auroc_mean']:.4f} ± {summary['logreg_auroc_std']:.4f}"
     )
-    print(f"Δ AUROC:    {summary['delta_vs_logreg']:+.4f}")
+    print(
+        f"XGB  AUROC: {summary['xgb_auroc_mean']:.4f} ± {summary['xgb_auroc_std']:.4f}"
+    )
+    print(f"Δ vs LR:    {summary['delta_vs_logreg']:+.4f}")
+    print(f"Δ vs XGB:   {summary['delta_vs_xgb']:+.4f}")
     print(f"{'='*72}")
 
     if config.get("wandb") and HAS_WANDB:
@@ -755,15 +796,21 @@ def run_cv(config):
                 "auprc_mean": summary["auprc_mean"],
                 "auprc_std": summary["auprc_std"],
                 "logreg_auroc_mean": summary["logreg_auroc_mean"],
+                "xgb_auroc_mean": summary["xgb_auroc_mean"],
                 "delta_vs_logreg": summary["delta_vs_logreg"],
+                "delta_vs_xgb": summary["delta_vs_xgb"],
             }
         )
-        # Per-fold test metrics as a wandb table
-        cols = ["fold", "auroc", "auprc", "logreg_auroc", "best_epoch"]
+        cols = ["fold", "auroc", "auprc", "logreg_auroc", "xgb_auroc", "best_epoch"]
         table = wandb.Table(columns=cols)
         for m in fold_metrics:
             table.add_data(
-                m["fold"], m["auroc"], m["auprc"], m["logreg_auroc"], m["best_epoch"]
+                m["fold"],
+                m["auroc"],
+                m["auprc"],
+                m["logreg_auroc"],
+                m.get("xgb_auroc", float("nan")),
+                m["best_epoch"],
             )
         wandb.log({"fold_results": table})
         wandb.finish()
@@ -788,7 +835,9 @@ def parse_args():
     p.add_argument("--cv_cutoff", type=float, default=None)
 
     # Architecture
-    p.add_argument("--conv_type", default="gatv2", choices=["gatv2", "transformer"])
+    p.add_argument(
+        "--conv_type", default="gatv2", choices=["gcn", "gat", "gatv2", "transformer"]
+    )
     p.add_argument("--layers", type=int, default=3, choices=[2, 3])
     p.add_argument("--node_emb_dim", type=int, default=8)
     p.add_argument("--hidden", type=int, default=64)

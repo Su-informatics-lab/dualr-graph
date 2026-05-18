@@ -27,7 +27,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATv2Conv, TransformerConv
+from torch_geometric.nn import GATConv, GATv2Conv, GCNConv, TransformerConv
 
 # ──────────────────────────────────────────────────────────────
 #  Helpers
@@ -75,7 +75,7 @@ def _repeat_edge_attr(
 
 
 class GraphBlock(nn.Module):
-    """GATv2 or TransformerConv block with LayerNorm + ELU + dropout."""
+    """GCN / GAT / GATv2 / TransformerConv block with LayerNorm + ELU + dropout."""
 
     def __init__(
         self,
@@ -89,8 +89,34 @@ class GraphBlock(nn.Module):
         add_self_loops: bool = True,
     ) -> None:
         super().__init__()
-        conv_type = conv_type.lower()
-        if conv_type == "gatv2":
+        self.conv_type = conv_type.lower()
+
+        if self.conv_type == "gcn":
+            # GCN ignores heads/concat — single-head, no concat.
+            # edge_weight is 1D scalar, not edge_attr.
+            self.conv = GCNConv(
+                in_dim,
+                out_dim,
+                add_self_loops=add_self_loops,
+                normalize=True,
+            )
+            actual_out = out_dim
+
+        elif self.conv_type == "gat":
+            self.conv = GATConv(
+                in_dim,
+                out_dim,
+                heads=heads,
+                concat=concat,
+                dropout=dropout,
+                edge_dim=edge_dim,
+                add_self_loops=add_self_loops,
+                fill_value=1.0,
+                residual=True,
+            )
+            actual_out = out_dim * heads if concat else out_dim
+
+        elif self.conv_type == "gatv2":
             self.conv = GATv2Conv(
                 in_dim,
                 out_dim,
@@ -99,10 +125,12 @@ class GraphBlock(nn.Module):
                 dropout=dropout,
                 edge_dim=edge_dim,
                 add_self_loops=add_self_loops,
-                fill_value=1.0,  # self-loop edge weight
+                fill_value=1.0,
                 residual=True,
             )
-        elif conv_type == "transformer":
+            actual_out = out_dim * heads if concat else out_dim
+
+        elif self.conv_type == "transformer":
             self.conv = TransformerConv(
                 in_dim,
                 out_dim,
@@ -112,12 +140,18 @@ class GraphBlock(nn.Module):
                 edge_dim=edge_dim,
                 beta=True,
             )
-        else:
-            raise ValueError(f"Unknown conv_type={conv_type!r}")
+            actual_out = out_dim * heads if concat else out_dim
 
-        actual_out = out_dim * heads if concat else out_dim
+        else:
+            raise ValueError(
+                f"Unknown conv_type={self.conv_type!r}; "
+                f"use gcn, gat, gatv2, or transformer"
+            )
+
         self.norm = nn.LayerNorm(actual_out)
         self.dropout = float(dropout)
+        # For GCN: track actual output dim (no multi-head)
+        self.actual_out = actual_out
 
     def forward(
         self,
@@ -125,7 +159,12 @@ class GraphBlock(nn.Module):
         edge_index: torch.Tensor,
         edge_attr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        x = self.conv(x, edge_index, edge_attr=edge_attr)
+        if self.conv_type == "gcn":
+            # GCN takes edge_weight [E] not edge_attr [E, d]
+            ew = edge_attr.squeeze(-1) if edge_attr is not None else None
+            x = self.conv(x, edge_index, edge_weight=ew)
+        else:
+            x = self.conv(x, edge_index, edge_attr=edge_attr)
         x = self.norm(x)
         x = F.elu(x)
         return F.dropout(x, p=self.dropout, training=self.training)
@@ -199,7 +238,7 @@ class FeatureGraphAE(nn.Module):
                     add_self_loops=add_self_loops,
                 )
             )
-            current = out_dim * out_heads if concat else out_dim
+            current = enc_blocks[-1].actual_out
         self.encoder = nn.ModuleList(enc_blocks)
 
         # ── GNN Decoder (SiGra-style) ────────────────────────────
@@ -215,7 +254,7 @@ class FeatureGraphAE(nn.Module):
         )
         self.dec2 = GraphBlock(
             conv_type=conv_type,
-            in_dim=hidden * heads,
+            in_dim=self.dec1.actual_out,
             out_dim=hidden,
             heads=1,
             concat=False,
