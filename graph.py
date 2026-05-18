@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-02_graph.py — Build feature-interaction graph.
+graph.py — Feature-interaction graph construction.
 
-Three edge construction methods:
-  1. spearman  — |Spearman ρ| between feature vectors (handles binary+continuous)
-  2. mi        — Normalized mutual information (discretizes continuous vars)
-  3. llm       — LLM-estimated pairwise associations (DualR bridge)
+Three edge methods:
+  1. spearman  — |Spearman ρ| (undirected, data-derived)
+  2. mi        — Normalized mutual information (undirected, data-derived)
+  3. llm       — LLM-estimated P(a|b) (DIRECTED, knowledge-derived)
 
-Each method produces:
-  - data/graph_{method}_k{k}.pt         edge_index tensor
-  - data/adj_{method}.npy               raw adjacency matrix (for visualization)
+Output per method:
+  data/graph_{method}_k{k}.pt   — dict with edge_index + edge_weight tensors
+  data/adj_{method}.npy         — raw adjacency (for visualization)
 
 Usage:
-    python 02_graph.py --method spearman --k 8
-    python 02_graph.py --method mi --k 8
-    python 02_graph.py --method llm --k 8 --llm_prior data/llm_adj.npy
-
-For LLM-prior edges, run 12_llm_edges.py first to generate data/llm_adj.npy.
+    python graph.py --method spearman --k 8
+    python graph.py --method llm --k 8 --llm_prior data/llm_adj.npy
+    python graph.py --method llm --k 8 --llm_prior data/llm_adj.npy --cv_cutoff 0.3
 """
 
 import argparse
@@ -28,170 +26,185 @@ import torch
 from scipy.stats import spearmanr
 from sklearn.metrics import normalized_mutual_info_score
 
-OUT = "data"
-
 
 def build_spearman(X: np.ndarray) -> np.ndarray:
     """Spearman correlation adjacency. X: [N_patients, F_features]."""
-    corr, _ = spearmanr(X)
-    if corr.ndim == 0:
-        # edge case: single feature
-        return np.array([[0.0]])
-    adj = np.abs(corr)
-    np.fill_diagonal(adj, 0)
+    F = X.shape[1]
+    rho, _ = spearmanr(X)
+    if rho.ndim == 0:
+        rho = np.array([[1.0]])
+    adj = np.abs(rho)
+    np.fill_diagonal(adj, 0.0)
     return adj
 
 
 def build_mi(X: np.ndarray, n_bins: int = 10) -> np.ndarray:
-    """Normalized mutual information adjacency. X: [N, F]."""
+    """Normalized mutual information adjacency. X: [N_patients, F_features]."""
     F = X.shape[1]
-    adj = np.zeros((F, F))
-    # Pre-discretize all columns
+    # Discretize continuous features for MI
     X_disc = np.zeros_like(X, dtype=int)
-    for i in range(F):
-        col = X[:, i]
-        unique = np.unique(col)
-        if len(unique) <= 2:
-            # Binary: keep as-is
-            X_disc[:, i] = col.astype(int)
+    for j in range(F):
+        col = X[:, j]
+        if len(np.unique(col)) <= n_bins:
+            X_disc[:, j] = col.astype(int)
         else:
-            bins = np.linspace(col.min() - 1e-8, col.max() + 1e-8, n_bins + 1)
-            X_disc[:, i] = np.digitize(col, bins)
+            X_disc[:, j] = np.digitize(
+                col, np.linspace(col.min(), col.max(), n_bins + 1)[1:-1]
+            )
 
+    adj = np.zeros((F, F), dtype=np.float64)
     for i in range(F):
         for j in range(i + 1, F):
-            mi = normalized_mutual_info_score(X_disc[:, i], X_disc[:, j])
-            adj[i, j] = adj[j, i] = mi
+            nmi = normalized_mutual_info_score(X_disc[:, i], X_disc[:, j])
+            adj[i, j] = nmi
+            adj[j, i] = nmi
     return adj
 
 
-def knn_sparsify(adj: np.ndarray, k: int, min_weight: float = 0.01) -> torch.Tensor:
-    """k-NN sparsification → edge_index [2, E] with self-loops."""
-    F = adj.shape[0]
-    edges = set()
-    for i in range(F):
-        topk = np.argsort(adj[i])[-k:]
-        for j in topk:
-            if i != j and adj[i, j] > min_weight:
-                edges.add((i, j))
-                edges.add((j, i))  # undirected
+def knn_sparsify(
+    adj: np.ndarray,
+    k: int = 8,
+    directed: bool = False,
+) -> tuple:
+    """
+    k-NN sparsification → (edge_index [2, E], edge_weight [E]).
 
-    if not edges:
-        # Fallback: connect all pairs above threshold
+    For undirected graphs (Spearman/MI): symmetrize by keeping edge if
+    EITHER endpoint has the other in its top-k.
+
+    For directed graphs (LLM): each node keeps its top-k INCOMING edges
+    (top-k strongest predictors for each target node). adj[i,j] = P(i|j),
+    so row i contains incoming weights for node i.
+    """
+    F = adj.shape[0]
+    sources, targets, weights = [], [], []
+
+    if directed:
+        # For each target node i, keep top-k source nodes j by adj[i,j]
+        for i in range(F):
+            row = adj[i, :]
+            nonzero = np.where(row > 0)[0]
+            if len(nonzero) == 0:
+                continue
+            topk = nonzero[np.argsort(row[nonzero])[-min(k, len(nonzero)) :]]
+            for j in topk:
+                sources.append(int(j))  # edge from j → i
+                targets.append(int(i))
+                weights.append(float(adj[i, j]))
+    else:
+        # Symmetric: keep if either direction is in top-k
+        mask = np.zeros_like(adj, dtype=bool)
+        for i in range(F):
+            row = adj[i, :]
+            topk = np.argsort(row)[-min(k, F - 1) :]
+            mask[i, topk] = True
+        # Symmetrize
+        mask = mask | mask.T
         for i in range(F):
             for j in range(F):
-                if i != j and adj[i, j] > min_weight:
-                    edges.add((i, j))
+                if mask[i, j] and adj[i, j] > 0:
+                    sources.append(i)
+                    targets.append(j)
+                    weights.append(float(adj[i, j]))
 
-    edge_list = sorted(edges)
-    edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
-
-    # Add self-loops
-    self_loops = torch.arange(F, dtype=torch.long).unsqueeze(0).repeat(2, 1)
-    edge_index = torch.cat([edge_index, self_loops], dim=1)
-
-    return edge_index
+    edge_index = torch.tensor([sources, targets], dtype=torch.long)
+    edge_weight = torch.tensor(weights, dtype=torch.float32)
+    return edge_index, edge_weight
 
 
-def print_graph_stats(
-    adj: np.ndarray, edge_index: torch.Tensor, feature_names: list, method: str, k: int
-):
-    F = adj.shape[0]
-    n_edges = edge_index.shape[1] - F  # subtract self-loops
-    density = n_edges / (F * (F - 1)) if F > 1 else 0
+def load_llm_graph(
+    data_dir: str = "data",
+    k: int = 8,
+    cv_cutoff: float = None,
+    llm_prior_path: str = None,
+) -> tuple:
+    """
+    Load LLM-estimated directed adjacency → (edge_index, edge_weight).
 
-    print(f"\n  Graph: {method}, k={k}")
-    print(f"    Nodes: {F}")
-    print(f"    Edges: {n_edges} (excl. self-loops)")
-    print(f"    Density: {density:.3f}")
+    If cv_cutoff is set, edges with coefficient of variation > cv_cutoff
+    are zeroed before sparsification (uncertainty-based pruning).
+    """
+    adj_path = llm_prior_path or os.path.join(data_dir, "llm_adj.npy")
+    adj = np.load(adj_path)
 
-    # Degree distribution
-    src = edge_index[0].numpy()
-    degrees = np.bincount(src, minlength=F) - 1  # subtract self-loop
-    print(
-        f"    Degree: mean={degrees.mean():.1f}, "
-        f"min={degrees.min()}, max={degrees.max()}"
-    )
+    # Optional: uncertainty-based cutoff
+    std_path = os.path.join(data_dir, "llm_adj_std.npy")
+    if cv_cutoff is not None and os.path.exists(std_path):
+        adj_std = np.load(std_path)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cv = np.where(adj > 0, adj_std / adj, np.inf)
+        n_before = np.count_nonzero(adj)
+        adj[cv > cv_cutoff] = 0.0
+        n_after = np.count_nonzero(adj)
+        print(f"  CV cutoff {cv_cutoff}: {n_before} → {n_after} edges")
 
-    # Top-3 strongest edges
-    flat = adj.flatten()
-    top_idx = np.argsort(flat)[-6:][::-1]  # top 6 (3 pairs, undirected)
-    seen = set()
-    print(f"    Top edges:")
-    for idx in top_idx:
-        i, j = divmod(idx, F)
-        if (min(i, j), max(i, j)) in seen:
-            continue
-        seen.add((min(i, j), max(i, j)))
-        print(
-            f"      {feature_names[i]:25s} ↔ {feature_names[j]:25s}  "
-            f"w={adj[i, j]:.3f}"
-        )
-        if len(seen) >= 3:
-            break
+    return knn_sparsify(adj, k=k, directed=True)
+
+
+# ══════════════════════════════════════════════════════════════
+# CLI
+# ══════════════════════════════════════════════════════════════
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--method", type=str, default="spearman", choices=["spearman", "mi", "llm"]
+        "--method", default="spearman", choices=["spearman", "mi", "llm"]
     )
     parser.add_argument("--k", type=int, default=8)
-    parser.add_argument("--min_weight", type=float, default=0.01)
-    parser.add_argument("--data_dir", type=str, default=OUT)
+    parser.add_argument("--data_dir", default="data")
+    parser.add_argument("--llm_prior", type=str, default=None)
     parser.add_argument(
-        "--llm_prior",
-        type=str,
+        "--cv_cutoff",
+        type=float,
         default=None,
-        help="Path to precomputed LLM adjacency (data/llm_adj.npy)",
+        help="Remove LLM edges with CV > this threshold",
     )
     args = parser.parse_args()
 
-    # Load feature matrix [F, N] and names
-    X_tensor = torch.load(
+    X = torch.load(
         os.path.join(args.data_dir, "feature_matrix.pt"), weights_only=True
-    )
+    ).numpy()
     with open(os.path.join(args.data_dir, "feature_names.json")) as f:
-        feature_names = json.load(f)
-
-    F, N = X_tensor.shape
-    X = X_tensor.numpy().T  # [N, F] for correlation computation
-
-    print("=" * 70)
-    print(f"GRAPH AI — Build Feature Graph ({args.method})")
-    print("=" * 70)
+        names = json.load(f)
+    F, N = X.shape
     print(f"  Features: {F}, Patients: {N}")
 
-    # Build adjacency
-    if args.method == "spearman":
-        adj = build_spearman(X)
-    elif args.method == "mi":
-        adj = build_mi(X)
-    elif args.method == "llm":
-        if args.llm_prior is None:
-            raise ValueError(
-                "--llm_prior required for method=llm. " "Run 12_llm_edges.py first."
-            )
-        adj = np.load(args.llm_prior)
-        if adj.shape != (F, F):
-            raise ValueError(f"LLM adjacency shape {adj.shape} != ({F}, {F})")
+    if args.method == "llm":
+        edge_index, edge_weight = load_llm_graph(
+            args.data_dir,
+            k=args.k,
+            cv_cutoff=args.cv_cutoff,
+            llm_prior_path=args.llm_prior,
+        )
+        adj = np.load(args.llm_prior or os.path.join(args.data_dir, "llm_adj.npy"))
+        directed = True
     else:
-        raise ValueError(f"Unknown method: {args.method}")
+        X_T = X.T  # [N, F]
+        if args.method == "spearman":
+            adj = build_spearman(X_T)
+        else:
+            adj = build_mi(X_T)
+        edge_index, edge_weight = knn_sparsify(adj, k=args.k, directed=False)
+        directed = False
 
-    # Sparsify
-    edge_index = knn_sparsify(adj, k=args.k, min_weight=args.min_weight)
-
-    # Stats
-    print_graph_stats(adj, edge_index, feature_names, args.method, args.k)
+    tag = f"{'directed' if directed else 'undirected'}"
+    print(f"  Method: {args.method} ({tag}), k={args.k}")
+    print(f"  Edges: {edge_index.shape[1]}")
+    print(f"  Weight range: [{edge_weight.min():.4f}, {edge_weight.max():.4f}]")
 
     # Save
+    out = {
+        "edge_index": edge_index,
+        "edge_weight": edge_weight,
+        "method": args.method,
+        "k": args.k,
+        "directed": directed,
+    }
     graph_path = os.path.join(args.data_dir, f"graph_{args.method}_k{args.k}.pt")
-    adj_path = os.path.join(args.data_dir, f"adj_{args.method}.npy")
-    torch.save(edge_index, graph_path)
-    np.save(adj_path, adj)
-    print(f"\n  Saved: {graph_path}")
-    print(f"  Saved: {adj_path}")
-    print("=" * 70)
+    torch.save(out, graph_path)
+    np.save(os.path.join(args.data_dir, f"adj_{args.method}.npy"), adj)
+    print(f"  Saved: {graph_path}")
 
 
 if __name__ == "__main__":
