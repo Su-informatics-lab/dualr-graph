@@ -1,125 +1,218 @@
 #!/usr/bin/env python3
 """
-models.py — Graph Autoencoder architectures for feature-interaction graph.
+models.py — Feature-graph risk model.
 
-Architecture: Encoder (2× GNN layers) → latent [F, d] → Decoder (linear) → [F, N]
+Architecture (per GPT diagnosis):
+  Encoder: GATv2 on feature graph → z [F, latent] (node embeddings)
+  Risk decoder: β_i = MLP(z_i, z_AKI) → logit_p = b + Σ β_i * x_ip
+  Skip: raw logistic regression β_skip·x (guarantees ≥ LogReg baseline)
 
-Key design choices (per Johnson et al. 2024, Annu Rev Biomed Data Sci):
-  - GATv2 as primary: learnable attention = ante hoc explainability
-  - Edge weights (LLM P(a|b)) passed as edge_attr to bias attention
-  - Shallow (2 layers) to avoid oversmoothing on 38-node graph
-  - Attention weights extractable for heatmap visualization
+Key insight: the decoder must produce PATIENT-LEVEL logits via a SHARED
+classifier (β·x), NOT via Linear(latent, N_patients). The old decoder
+had one output neuron per patient ID — test patients got zero gradient.
 
-Usage:
-    model = build_model("gatv2", in_channels=2292, hidden=64, latent=16,
-                        heads=4, dropout=0.2, edge_dim=1)
-    x_recon, z = model(x, edge_index, edge_attr=edge_weight)
-    attn = model.get_attention(x, edge_index, edge_attr=edge_weight)
+The learned β_i are directly interpretable alongside the attention heatmap.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.nn import GATv2Conv, GCNConv, TransformerConv
+import torch.nn.functional as Fnn
+from torch_geometric.nn import GATv2Conv
+
+# ══════════════════════════════════════════════════════════════
+# Risk decoder: graph embeddings → per-feature weights → patient logits
+# ══════════════════════════════════════════════════════════════
 
 
-class GraphAE(nn.Module):
-    """Graph Autoencoder base class."""
-
-    def __init__(self, in_channels, hidden, latent, dropout=0.2):
-        super().__init__()
-        self.in_channels = in_channels
-        self.hidden = hidden
-        self.latent = latent
-        self.dropout = dropout
-        # Shared decoder for reconstruction (non-AKI nodes)
-        self.decoder = nn.Sequential(
-            nn.Linear(latent, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, in_channels),
-        )
-        # Dedicated AKI classifier — separate weights so AKI prediction
-        # doesn't compete with heterogeneous feature reconstruction
-        self.aki_head = nn.Sequential(
-            nn.Linear(latent, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, in_channels),
-        )
-
-    def encode(self, x, edge_index, edge_attr=None):
-        raise NotImplementedError
-
-    def forward(self, x, edge_index, edge_attr=None, aki_idx=None):
-        z = self.encode(x, edge_index, edge_attr)
-        x_recon = self.decoder(z)
-        if aki_idx is not None:
-            x_recon = x_recon.clone()
-            x_recon[aki_idx] = self.aki_head(z[aki_idx])
-        return x_recon, z
-
-    def get_attention(self, x, edge_index, edge_attr=None):
-        """Override in attention-based models to return attention weights."""
-        return None
-
-
-class GATv2AE(GraphAE):
+class FeatureGraphRiskDecoder(nn.Module):
     """
-    GATv2 Autoencoder — primary architecture.
+    Shared risk decoder.
 
-    Supports edge_attr (LLM-estimated P(a|b)) as attention bias.
-    GATv2Conv uses dynamic attention: a^T LeakyReLU(W[x_i || x_j] + W_e·e_ij)
-    When edge_dim is set, edge attributes are projected and added to the
-    attention computation, biasing message passing by clinical knowledge.
+    For each non-AKI feature i:
+      β_i = MLP(concat(z_i, z_AKI))    ← weight from graph embedding
+    For each patient p:
+      logit_p = bias + Σ_i β_i * x_ip  ← weighted sum of feature values
+
+    This restores patient exchangeability: logit depends on patient's
+    FEATURE VALUES, not their column index in the tensor.
+    """
+
+    def __init__(self, latent, hidden=32):
+        super().__init__()
+        self.beta_mlp = nn.Sequential(
+            nn.Linear(2 * latent, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+        self.bias = nn.Parameter(torch.zeros(()))
+
+    def forward(self, z, x, aki_idx):
+        """
+        Args:
+            z: [F, latent] node embeddings from encoder
+            x: [F, N] feature matrix (with AKI row)
+            aki_idx: int
+        Returns:
+            logits: [N] patient-level AKI logits
+            beta: [F-1] learned per-feature weights
+        """
+        F_nodes = z.size(0)
+        feat_idx = [i for i in range(F_nodes) if i != aki_idx]
+
+        z_feat = z[feat_idx]  # [F-1, latent]
+        z_aki = z[aki_idx].unsqueeze(0).expand_as(z_feat)  # [F-1, latent]
+
+        # Per-feature weight from graph embeddings
+        beta = self.beta_mlp(torch.cat([z_feat, z_aki], dim=1)).squeeze(-1)  # [F-1]
+
+        # Patient logits = weighted sum of features
+        x_feat = x[feat_idx, :]  # [F-1, N]
+        logits = self.bias + beta @ x_feat  # [N]
+
+        return logits, beta
+
+
+# ══════════════════════════════════════════════════════════════
+# Encoder: GATv2 on feature graph
+# ══════════════════════════════════════════════════════════════
+
+
+class FeatureGraphRiskModel(nn.Module):
+    """
+    Feature-graph risk model with LogReg skip connection.
+
+    logit_p = raw_skip(x_p) + GAT_risk(z, x_p)
+
+    The raw_skip ensures the model can match LogReg baseline immediately.
+    The GAT path learns graph-structured residual signal.
     """
 
     def __init__(
-        self, in_channels, hidden, latent, heads=4, dropout=0.2, edge_dim=None
+        self,
+        num_features,
+        aki_idx,
+        hidden=32,
+        latent=16,
+        heads=2,
+        dropout=0.1,
+        edge_dim=None,
     ):
-        super().__init__(in_channels, hidden, latent, dropout)
+        super().__init__()
+        self.num_features = num_features
+        self.aki_idx = aki_idx
+        self.non_aki = [i for i in range(num_features) if i != aki_idx]
+
+        # ── GATv2 encoder ─────────────────────────────────────
+        # in_channels = N (patient values per feature node)
+        # Set dynamically in forward() via lazy init or pass explicitly
+        self.conv1 = None  # lazy init on first forward
+        self.conv2 = None
+        self.norm1 = None
+        self.hidden = hidden
+        self.latent = latent
+        self.heads = heads
+        self.dropout = dropout
+        self.edge_dim = edge_dim
+        self._encoder_built = False
+
+        # ── Risk decoder ──────────────────────────────────────
+        self.risk_decoder = FeatureGraphRiskDecoder(latent, hidden)
+
+        # ── Raw LogReg skip (no graph needed) ─────────────────
+        self.raw_skip = nn.Linear(num_features - 1, 1, bias=True)
+
+        # ── Optional: masked feature reconstruction head ──────
+        self.recon_head = nn.Linear(latent, 1)
+
+    def _build_encoder(self, in_channels):
+        """Lazy encoder init — called on first forward with actual N."""
+        device = self.raw_skip.weight.device
         self.conv1 = GATv2Conv(
             in_channels,
-            hidden,
-            heads=heads,
-            dropout=dropout,
+            self.hidden,
+            heads=self.heads,
             concat=True,
-            edge_dim=edge_dim,
-        )
+            dropout=self.dropout,
+            edge_dim=self.edge_dim,
+            add_self_loops=False,
+            residual=True,
+        ).to(device)
+        self.norm1 = nn.LayerNorm(self.hidden * self.heads).to(device)
         self.conv2 = GATv2Conv(
-            hidden * heads,
-            latent,
+            self.hidden * self.heads,
+            self.latent,
             heads=1,
-            dropout=dropout,
             concat=False,
-            edge_dim=edge_dim,
-        )
-        self.norm1 = nn.LayerNorm(hidden * heads)
-        self.edge_dim = edge_dim
+            dropout=self.dropout,
+            edge_dim=self.edge_dim,
+            add_self_loops=False,
+            residual=True,
+        ).to(device)
+        self._encoder_built = True
 
     def encode(self, x, edge_index, edge_attr=None):
+        """x: [F, N] → z: [F, latent]"""
+        if not self._encoder_built:
+            self._build_encoder(x.size(1))
         ea = edge_attr if self.edge_dim else None
         h = self.conv1(x, edge_index, edge_attr=ea)
         h = self.norm1(h)
-        h = F.elu(h)
-        h = F.dropout(h, p=self.dropout, training=self.training)
+        h = Fnn.elu(h)
+        h = Fnn.dropout(h, p=self.dropout, training=self.training)
         z = self.conv2(h, edge_index, edge_attr=ea)
         return z
 
+    def forward(self, x, edge_index, edge_attr=None):
+        """
+        Args:
+            x: [F, N] feature matrix (AKI row present but zeroed externally)
+            edge_index: [2, E]
+            edge_attr: [E, 1] optional edge weights
+        Returns:
+            logits: [N] patient-level AKI logits
+            beta: [F-1] learned feature weights from graph
+            recon: [F, N] optional reconstruction for masked feature modeling
+        """
+        # Encode
+        z = self.encode(x, edge_index, edge_attr)  # [F, latent]
+
+        # Risk decoder: graph-derived feature weights
+        gat_logits, beta = self.risk_decoder(z, x, self.aki_idx)  # [N], [F-1]
+
+        # Raw LogReg skip: direct path from features to prediction
+        x_non_aki = x[self.non_aki, :].T  # [N, F-1]
+        skip_logits = self.raw_skip(x_non_aki).squeeze(-1)  # [N]
+
+        # Combined logits
+        logits = skip_logits + gat_logits  # [N]
+
+        # Optional reconstruction for masked feature modeling
+        recon = self.recon_head(z).squeeze(-1)  # [F]... but we need [F, N]
+        # Actually: recon per node is z[i] → scalar. For masked feature modeling,
+        # we predict masked feature values. This is handled in the loss function.
+
+        return logits, beta, z
+
     def get_attention(self, x, edge_index, edge_attr=None):
-        """Extract attention weights from both layers."""
+        """Extract GATv2 attention weights for heatmap."""
         self.eval()
+        if not self._encoder_built:
+            self._build_encoder(x.size(1))
         ea = edge_attr if self.edge_dim else None
         with torch.no_grad():
-            # Layer 1
             h1, (ei1, aw1) = self.conv1(
-                x, edge_index, edge_attr=ea, return_attention_weights=True
+                x,
+                edge_index,
+                edge_attr=ea,
+                return_attention_weights=True,
             )
             h1 = self.norm1(h1)
-            h1 = F.elu(h1)
-            # Layer 2
+            h1 = Fnn.elu(h1)
             _, (ei2, aw2) = self.conv2(
-                h1, edge_index, edge_attr=ea, return_attention_weights=True
+                h1,
+                edge_index,
+                edge_attr=ea,
+                return_attention_weights=True,
             )
         return {
             "layer1": {"edge_index": ei1.cpu(), "attention": aw1.cpu()},
@@ -127,98 +220,23 @@ class GATv2AE(GraphAE):
         }
 
 
-class GCNAE(GraphAE):
-    """GCN Autoencoder — baseline without attention (undirected only)."""
-
-    def __init__(self, in_channels, hidden, latent, dropout=0.2, **kwargs):
-        super().__init__(in_channels, hidden, latent, dropout)
-        self.conv1 = GCNConv(in_channels, hidden)
-        self.conv2 = GCNConv(hidden, latent)
-        self.norm1 = nn.LayerNorm(hidden)
-
-    def encode(self, x, edge_index, edge_attr=None):
-        # GCN can use edge_weight (scalar) but not edge_attr (vector)
-        ew = (
-            edge_attr.squeeze(-1)
-            if edge_attr is not None and edge_attr.dim() > 1
-            else edge_attr
-        )
-        h = self.conv1(x, edge_index, edge_weight=ew)
-        h = self.norm1(h)
-        h = F.elu(h)
-        h = F.dropout(h, p=self.dropout, training=self.training)
-        z = self.conv2(h, edge_index, edge_weight=ew)
-        return z
-
-
-class TransformerAE(GraphAE):
-    """TransformerConv Autoencoder — highest expressivity but may collapse."""
-
-    def __init__(
-        self, in_channels, hidden, latent, heads=4, dropout=0.2, edge_dim=None
-    ):
-        super().__init__(in_channels, hidden, latent, dropout)
-        self.conv1 = TransformerConv(
-            in_channels,
-            hidden,
-            heads=heads,
-            dropout=dropout,
-            concat=True,
-            edge_dim=edge_dim,
-        )
-        self.conv2 = TransformerConv(
-            hidden * heads,
-            latent,
-            heads=1,
-            dropout=dropout,
-            concat=False,
-            edge_dim=edge_dim,
-        )
-        self.norm1 = nn.LayerNorm(hidden * heads)
-        self.edge_dim = edge_dim
-
-    def encode(self, x, edge_index, edge_attr=None):
-        ea = edge_attr if self.edge_dim else None
-        h = self.conv1(x, edge_index, edge_attr=ea)
-        h = self.norm1(h)
-        h = F.elu(h)
-        h = F.dropout(h, p=self.dropout, training=self.training)
-        z = self.conv2(h, edge_index, edge_attr=ea)
-        return z
-
-    def get_attention(self, x, edge_index, edge_attr=None):
-        self.eval()
-        ea = edge_attr if self.edge_dim else None
-        with torch.no_grad():
-            _, aw1 = self.conv1(
-                x, edge_index, edge_attr=ea, return_attention_weights=True
-            )
-            h = self.norm1(self.conv1(x, edge_index, edge_attr=ea))
-            h = F.elu(h)
-            _, aw2 = self.conv2(
-                h, edge_index, edge_attr=ea, return_attention_weights=True
-            )
-        return {
-            "layer1": {"edge_index": aw1[0].cpu(), "attention": aw1[1].cpu()},
-            "layer2": {"edge_index": aw2[0].cpu(), "attention": aw2[1].cpu()},
-        }
-
-
 def build_model(
-    arch: str = "gatv2",
-    in_channels: int = 2292,
-    hidden: int = 64,
-    latent: int = 16,
-    heads: int = 4,
-    dropout: float = 0.2,
-    edge_dim: int = None,
-) -> GraphAE:
-    """Factory function for graph autoencoder models."""
-    if arch == "gatv2":
-        return GATv2AE(in_channels, hidden, latent, heads, dropout, edge_dim)
-    elif arch == "gcn":
-        return GCNAE(in_channels, hidden, latent, dropout)
-    elif arch == "transformer":
-        return TransformerAE(in_channels, hidden, latent, heads, dropout, edge_dim)
-    else:
-        raise ValueError(f"Unknown architecture: {arch}")
+    num_features=38,
+    aki_idx=37,
+    hidden=32,
+    latent=16,
+    heads=2,
+    dropout=0.1,
+    edge_dim=None,
+    **kwargs,
+):
+    """Factory function."""
+    return FeatureGraphRiskModel(
+        num_features=num_features,
+        aki_idx=aki_idx,
+        hidden=hidden,
+        latent=latent,
+        heads=heads,
+        dropout=dropout,
+        edge_dim=edge_dim,
+    )
