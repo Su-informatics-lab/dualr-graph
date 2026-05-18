@@ -254,6 +254,9 @@ def run_cv(config, data_dir="data", wandb_run=None):
     from sklearn.preprocessing import StandardScaler as SkScaler
 
     non_aki_idx = [i for i in range(F_nodes) if i != aki_idx]
+    outer_skf = StratifiedKFold(
+        n_splits=config["cv_folds"], shuffle=True, random_state=42
+    )
     _aurocs = []
     for _tr, _te in outer_skf.split(np.zeros(N), y_all):
         _sc = SkScaler()
@@ -262,10 +265,6 @@ def run_cv(config, data_dir="data", wandb_run=None):
         _lr = SkLogReg(C=1.0, max_iter=5000).fit(_Xtr, y_all[_tr])
         _aurocs.append(roc_auc_score(y_all[_te], _lr.predict_proba(_Xte)[:, 1]))
     print(f"  sklearn LogReg check: AUROC={np.mean(_aurocs):.4f}±{np.std(_aurocs):.4f}")
-    # Reset CV iterator
-    outer_skf = StratifiedKFold(
-        n_splits=config["cv_folds"], shuffle=True, random_state=42
-    )
 
     # Outer CV
     outer_skf = StratifiedKFold(
