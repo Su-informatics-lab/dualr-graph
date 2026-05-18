@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --job-name=gae_sweep
-#___ACCOUNT___
-#___PARTITION___
+#SBATCH --account=r01109
+#SBATCH --partition=general
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
