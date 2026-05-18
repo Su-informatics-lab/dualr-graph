@@ -1,31 +1,13 @@
 #!/usr/bin/env python3
 """
-train.py — Semi-supervised 5-fold CV for the feature-graph autoencoder.
+train.py — Training strategies for the feature-graph autoencoder.
 
-Implements Dr. Su's whiteboard objective:
+Three strategies (--strategy):
+  joint             : encoder+decoder+head trained end-to-end (default)
+  pretrain_finetune : Phase 1 L_rec only → Phase 2 freeze encoder, train head
+  embed_xgb         : Phase 1 L_rec → extract embeddings → XGBoost on [emb ‖ raw]
 
-    L = lambda_rec * L_rec + L_AKI
-
-Defaults match the whiteboard sketch:
-  - AKI prediction = reconstruction of AKI node (not separate head)
-  - Train AKI labels visible as input; val/test AKI masked
-  - Reconstruction loss uses ALL patients (transductive, semi-supervised)
-  - lambda_rec = 0.5 (tunable toward 0)
-  - Denoising masking (20%) prevents identity shortcut
-  - Missing values: iterative imputation from model predictions
-
-Quick start:
-    python train.py --edge_method llm --use_edge_weights --layers 3
-
-First sweep:
-    for E in llm spearman mi; do
-      for L in 2 3; do
-        for R in 0 0.1 0.5 1.0; do
-          python train.py --edge_method $E --layers $L --lambda_rec $R \\
-            --run_name gae_${E}_l${L}_lam${R}
-        done
-      done
-    done
+Evidence:  GraphMAE (KDD 2022), S2GAE (WSDM 2023), GRAPE (NeurIPS 2020).
 """
 
 from __future__ import annotations
@@ -35,7 +17,7 @@ import copy
 import json
 import os
 import random
-from typing import Dict, List
+import time
 
 import numpy as np
 import pandas as pd
@@ -53,10 +35,10 @@ except ImportError:
     HAS_WANDB = False
 
 from graph import build_mi, build_spearman, knn_sparsify, load_llm_graph
-from models import build_model
+from models import UncertaintyWeighting, build_model
 
 # ──────────────────────────────────────────────────────────────
-#  Fold data container
+#  Utilities (unchanged)
 # ──────────────────────────────────────────────────────────────
 
 
@@ -74,91 +56,60 @@ class FoldData:
     def __init__(
         self, x_filled, x_target, observed_mask, input_missing, y, train_prior, stats
     ):
-        self.x_filled = x_filled  # [N, F]
-        self.x_target = x_target  # [N, F]
-        self.observed_mask = observed_mask  # [N, F] bool
-        self.input_missing = input_missing  # [N, F] bool
-        self.y = y  # [N]
-        self.train_prior = train_prior  # float
-        self.stats = stats
+        self.x_filled, self.x_target = x_filled, x_target
+        self.observed_mask, self.input_missing = observed_mask, input_missing
+        self.y, self.train_prior, self.stats = y, train_prior, stats
 
 
-# ──────────────────────────────────────────────────────────────
-#  Utilities
-# ──────────────────────────────────────────────────────────────
-
-
-def set_seed(seed: int) -> None:
+def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
-def safe_auroc(y_true, y_score):
+def safe_auroc(y, p):
+    return float(roc_auc_score(y, p)) if len(np.unique(y)) > 1 else float("nan")
+
+
+def safe_auprc(y, p):
     return (
-        float(roc_auc_score(y_true, y_score))
-        if len(np.unique(y_true)) > 1
-        else float("nan")
-    )
-
-
-def safe_auprc(y_true, y_score):
-    return (
-        float(average_precision_score(y_true, y_score))
-        if len(np.unique(y_true)) > 1
-        else float("nan")
+        float(average_precision_score(y, p)) if len(np.unique(y)) > 1 else float("nan")
     )
 
 
 def iter_batches(indices, batch_size, shuffle=True):
-    indices = np.asarray(indices)
-    if shuffle:
-        indices = np.random.permutation(indices)
-    for start in range(0, len(indices), batch_size):
-        yield indices[start : start + batch_size]
+    idx = np.random.permutation(indices) if shuffle else np.asarray(indices)
+    for s in range(0, len(idx), batch_size):
+        yield idx[s : s + batch_size]
 
 
-def _mode_or_mean(values: torch.Tensor) -> float:
-    if values.numel() == 0:
+def _mode_or_mean(v):
+    if v.numel() == 0:
         return 0.0
-    vals, counts = torch.unique(values.float(), return_counts=True)
-    return float(vals[counts.argmax()].item())
+    vals, cts = torch.unique(v.float(), return_counts=True)
+    return float(vals[cts.argmax()].item())
 
 
 # ──────────────────────────────────────────────────────────────
-#  Per-fold preprocessing
+#  Preprocessing (unchanged)
 # ──────────────────────────────────────────────────────────────
 
 
 def preprocess_fold(
-    X_nf: torch.Tensor,
-    missing_nf: torch.Tensor,
-    binary_mask_f: torch.Tensor,
-    train_idx: np.ndarray,
-    aki_idx: int,
-    impute_strategy: str = "mean",
-    use_label_input: bool = True,
-) -> FoldData:
-    """
-    Standardize continuous features, impute missing, handle AKI column.
-
-    Default (use_label_input=True, whiteboard design):
-      - Train patients: AKI column = true label, missing_flag = False
-      - Val/test patients: AKI column = train prior, missing_flag = True
-
-    Ablation (use_label_input=False):
-      - All patients: AKI column = train prior, missing_flag = True
-      - Labels enter only through L_AKI
-    """
+    X_nf,
+    missing_nf,
+    binary_mask_f,
+    train_idx,
+    aki_idx,
+    impute_strategy="mean",
+    use_label_input=True,
+):
     X_nf = X_nf.float().clone()
     missing_nf = missing_nf.bool().clone()
     binary_mask_f = binary_mask_f.bool().clone()
     N, F = X_nf.shape
     train_t = torch.as_tensor(train_idx, dtype=torch.long)
-
     y = X_nf[:, aki_idx].float().clone()
     prior = float(y[train_t].mean().item())
     if not np.isfinite(prior):
@@ -168,109 +119,67 @@ def preprocess_fold(
     x_target = X_nf.clone()
     observed = ~missing_nf.clone()
     input_missing = missing_nf.clone()
-    stats: Dict = {}
-
+    stats = {}
     for j in range(F):
         if j == aki_idx:
             continue
-
         obs_train = train_t[~missing_nf[train_t, j]]
         vals_train = X_nf[obs_train, j].float()
-
         if binary_mask_f[j]:
             fill = _mode_or_mean(vals_train)
             x_filled[missing_nf[:, j], j] = fill
             x_target[missing_nf[:, j], j] = fill
-            stats[str(j)] = {"kind": "binary", "fill": fill}
         else:
-            if vals_train.numel() == 0:
-                mean, std, fill_raw = 0.0, 1.0, 0.0
-            else:
-                mean = float(vals_train.mean().item())
-                std = float(vals_train.std(unbiased=False).item())
-                if std < 1e-6:
-                    std = 1.0
-                fill_raw = (
-                    float(vals_train.median().item())
-                    if impute_strategy == "median"
-                    else mean
-                )
-
+            mean = float(vals_train.mean()) if vals_train.numel() else 0.0
+            std = float(vals_train.std(unbiased=False)) if vals_train.numel() else 1.0
+            if std < 1e-6:
+                std = 1.0
+            fill_raw = (
+                float(vals_train.median())
+                if impute_strategy == "median" and vals_train.numel()
+                else mean
+            )
             obs_all = ~missing_nf[:, j]
             x_filled[obs_all, j] = (X_nf[obs_all, j] - mean) / std
             x_target[obs_all, j] = x_filled[obs_all, j]
             fill_std = (fill_raw - mean) / std
             x_filled[missing_nf[:, j], j] = fill_std
             x_target[missing_nf[:, j], j] = fill_std
-            stats[str(j)] = {
-                "kind": "continuous",
-                "mean": mean,
-                "std": std,
-                "fill": fill_std,
-            }
 
-    # ── AKI column ────────────────────────────────────────────
     if use_label_input:
-        # Whiteboard: train labels visible, val/test masked
         x_filled[:, aki_idx] = prior
         x_filled[train_t, aki_idx] = y[train_t]
         input_missing[:, aki_idx] = True
         input_missing[train_t, aki_idx] = False
     else:
-        # Ablation: all patients get prior, labels only in L_AKI
         x_filled[:, aki_idx] = prior
         input_missing[:, aki_idx] = True
-
     x_target[:, aki_idx] = prior
     observed[:, aki_idx] = False
-
-    return FoldData(
-        x_filled=x_filled,
-        x_target=x_target,
-        observed_mask=observed,
-        input_missing=input_missing,
-        y=y,
-        train_prior=prior,
-        stats=stats,
-    )
-
-
-# ──────────────────────────────────────────────────────────────
-#  Graph construction (per-fold for data-derived edges)
-# ──────────────────────────────────────────────────────────────
+    return FoldData(x_filled, x_target, observed, input_missing, y, prior, stats)
 
 
 def make_graph_for_fold(config, fold_data, train_idx, aki_idx, data_dir):
-    """Build feature graph without using val/test AKI labels."""
     method = config["edge_method"]
     if method in ("spearman", "mi"):
         x_graph = fold_data.x_filled.clone()
         x_graph[:, aki_idx] = fold_data.train_prior
         x_graph[train_idx, aki_idx] = fold_data.y[train_idx]
         X_train_np = x_graph[train_idx].cpu().numpy()
-        if method == "spearman":
-            adj = build_spearman(X_train_np)
-        else:
-            adj = build_mi(X_train_np)
+        adj = (
+            build_spearman(X_train_np) if method == "spearman" else build_mi(X_train_np)
+        )
         edge_index, edge_weight = knn_sparsify(adj, k=config["k"], directed=False)
     else:
         edge_index, edge_weight = load_llm_graph(
-            data_dir=data_dir,
-            k=config["k"],
-            cv_cutoff=config.get("cv_cutoff"),
+            data_dir=data_dir, k=config["k"], cv_cutoff=config.get("cv_cutoff")
         )
     return edge_index.long(), edge_weight.float()
-
-
-# ──────────────────────────────────────────────────────────────
-#  Denoising masking
-# ──────────────────────────────────────────────────────────────
 
 
 def denoise_batch(
     x_filled, input_missing, observed_mask, batch_idx, non_aki_mask_f, mask_rate
 ):
-    """Randomly hide observed non-AKI cells (denoising autoencoder)."""
     idx = torch.as_tensor(batch_idx, dtype=torch.long, device=x_filled.device)
     x_b = x_filled[idx].clone()
     miss_b = input_missing[idx].clone()
@@ -282,9 +191,17 @@ def denoise_batch(
     return x_b, miss_b
 
 
-# ──────────────────────────────────────────────────────────────
-#  Loss
-# ──────────────────────────────────────────────────────────────
+@torch.no_grad()
+def score_indices(
+    model, x_filled, input_missing, edge_index, edge_attr, indices, batch_size
+):
+    model.eval()
+    probs = []
+    for bi in iter_batches(indices, batch_size, shuffle=False):
+        idx = torch.as_tensor(bi, dtype=torch.long, device=x_filled.device)
+        out = model(x_filled[idx], edge_index, edge_attr, input_missing[idx])
+        probs.append(torch.sigmoid(out.aki_logits).cpu().numpy())
+    return np.concatenate(probs)
 
 
 def compute_loss(
@@ -297,7 +214,9 @@ def compute_loss(
     pseudo_weight,
     pos_weight,
     aki_weight=1.0,
+    uw=None,
 ):
+    """Compute L = λ·L_rec + α·L_AKI  (or uncertainty-weighted)."""
     device = out.x_hat.device
     idx = torch.as_tensor(batch_idx, dtype=torch.long, device=device)
     target = fold_data.x_target[idx].to(device)
@@ -310,7 +229,7 @@ def compute_loss(
 
     if lambda_rec > 0 and rec_w.sum() > 0:
         rec_loss = ((out.x_hat - target).pow(2) * rec_w).sum() / rec_w.sum().clamp_min(
-            1.0
+            1
         )
     else:
         rec_loss = torch.tensor(0.0, device=device)
@@ -319,71 +238,439 @@ def compute_loss(
     if ce_mask.any():
         y = fold_data.y[idx].to(device)
         aki_loss = F.binary_cross_entropy_with_logits(
-            out.aki_logits[ce_mask],
-            y[ce_mask],
-            pos_weight=pos_weight,
+            out.aki_logits[ce_mask], y[ce_mask], pos_weight=pos_weight
         )
     else:
         aki_loss = torch.tensor(0.0, device=device)
 
-    loss = lambda_rec * rec_loss + aki_weight * aki_loss
+    if uw is not None:
+        loss = uw(rec_loss, aki_loss)
+    else:
+        loss = lambda_rec * rec_loss + aki_weight * aki_loss
+
     return loss, {"rec": float(rec_loss.detach()), "aki": float(aki_loss.detach())}
 
 
-# ──────────────────────────────────────────────────────────────
-#  Inference
-# ──────────────────────────────────────────────────────────────
+def compute_rec_only_loss(out, batch_idx, fold_data, non_aki_mask_f, pseudo_weight):
+    """Reconstruction loss only (for pretraining phase)."""
+    device = out.x_hat.device
+    idx = torch.as_tensor(batch_idx, dtype=torch.long, device=device)
+    target = fold_data.x_target[idx].to(device)
+    observed = fold_data.observed_mask[idx].to(device)
+    non_aki = non_aki_mask_f.to(device).unsqueeze(0)
+    rec_w = (observed & non_aki).float()
+    if pseudo_weight > 0:
+        rec_w = rec_w + pseudo_weight * ((~observed) & non_aki).float()
+    if rec_w.sum() > 0:
+        loss = ((out.x_hat - target).pow(2) * rec_w).sum() / rec_w.sum().clamp_min(1)
+    else:
+        loss = torch.tensor(0.0, device=device)
+    return loss
 
 
-@torch.no_grad()
-def score_indices(
-    model, x_filled, input_missing, edge_index, edge_attr, indices, batch_size
-):
-    model.eval()
-    probs = []
-    for batch_idx in iter_batches(indices, batch_size=batch_size, shuffle=False):
-        idx = torch.as_tensor(batch_idx, dtype=torch.long, device=x_filled.device)
-        out = model(
-            x_filled[idx],
-            edge_index=edge_index,
-            edge_attr=edge_attr,
-            missing_mask=input_missing[idx],
+def run_baselines(fold_data, train_idx, test_idx, num_features, aki_idx, config):
+    """LogReg + XGBoost baselines on same preprocessed data."""
+    non_aki = [i for i in range(num_features) if i != aki_idx]
+    X_bl = fold_data.x_filled[:, non_aki].cpu().numpy()
+    y_np = fold_data.y.cpu().numpy()
+
+    lr = LogisticRegression(
+        max_iter=5000, class_weight="balanced", C=config["logreg_C"]
+    )
+    lr.fit(X_bl[train_idx], y_np[train_idx])
+    lr_prob = lr.predict_proba(X_bl[test_idx])[:, 1]
+    lr_auc, lr_auprc = safe_auroc(y_np[test_idx], lr_prob), safe_auprc(
+        y_np[test_idx], lr_prob
+    )
+
+    xgb_auc, xgb_auprc = float("nan"), float("nan")
+    try:
+        from xgboost import XGBClassifier
+
+        n_pos = y_np[train_idx].sum()
+        n_neg = len(train_idx) - n_pos
+        xgb = XGBClassifier(
+            n_estimators=200,
+            max_depth=4,
+            learning_rate=0.1,
+            scale_pos_weight=max(1, n_neg / max(1, n_pos)),
+            eval_metric="logloss",
+            verbosity=0,
+            random_state=config["seed"],
         )
-        probs.append(torch.sigmoid(out.aki_logits).cpu().numpy())
-    return np.concatenate(probs, axis=0)
+        xgb.fit(X_bl[train_idx], y_np[train_idx])
+        xgb_prob = xgb.predict_proba(X_bl[test_idx])[:, 1]
+        xgb_auc = safe_auroc(y_np[test_idx], xgb_prob)
+        xgb_auprc = safe_auprc(y_np[test_idx], xgb_prob)
+    except ImportError:
+        pass
+    return lr_auc, lr_auprc, xgb_auc, xgb_auprc
 
 
 # ──────────────────────────────────────────────────────────────
-#  Iterative imputation
+#  Strategy: JOINT (end-to-end encoder+decoder+head)
 # ──────────────────────────────────────────────────────────────
 
 
-@torch.no_grad()
-def update_missing_from_recon(
-    model, fold_data, edge_index, edge_attr, non_aki_mask_f, batch_size
+def _train_joint(
+    fold,
+    model,
+    fold_data,
+    edge_index,
+    edge_attr,
+    train_idx,
+    val_idx,
+    non_aki_mask_f,
+    config,
+    device,
 ):
-    """Replace missing non-AKI cells with detached reconstruction."""
+    """Joint training with optional uncertainty weighting."""
+    N = fold_data.x_filled.size(0)
+    train_indicator = torch.zeros(N, dtype=torch.bool, device=device)
+    train_indicator[torch.as_tensor(train_idx, device=device)] = True
+    fit_idx = np.arange(N) if not config["strict_recon"] else train_idx
+
+    y_train = fold_data.y[torch.as_tensor(train_idx, device=device)]
+    pos_weight = (
+        (y_train == 0).sum().float() / (y_train == 1).sum().float().clamp_min(1)
+    ).clamp(max=config["max_pos_weight"])
+
+    uw = None
+    params = list(model.parameters())
+    if config.get("uw"):
+        uw = UncertaintyWeighting().to(device)
+        params += list(uw.parameters())
+
+    optimizer = torch.optim.AdamW(
+        params, lr=config["lr"], weight_decay=config["weight_decay"]
+    )
+    warmup_ep = config.get("warmup_epochs", 20)
+
+    def lr_lambda(ep):
+        if ep < warmup_ep:
+            return max(0.1, ep / warmup_ep)
+        prog = (ep - warmup_ep) / max(1, config["epochs"] - warmup_ep)
+        return max(0.01, 0.5 * (1 + np.cos(np.pi * prog)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    best_val, best_epoch, best_state = -np.inf, -1, copy.deepcopy(model.state_dict())
+    patience_left = config["patience"]
+
+    for epoch in range(1, config["epochs"] + 1):
+        model.train()
+        if uw:
+            uw.train()
+        epoch_losses = []
+        for bi in iter_batches(fit_idx, config["batch_size"], shuffle=True):
+            x_b, miss_b = denoise_batch(
+                fold_data.x_filled,
+                fold_data.input_missing,
+                fold_data.observed_mask,
+                bi,
+                non_aki_mask_f,
+                config["mask_rate"],
+            )
+            out = model(x_b, edge_index, edge_attr, miss_b)
+            loss, parts = compute_loss(
+                out,
+                bi,
+                fold_data,
+                train_indicator,
+                non_aki_mask_f,
+                config["lambda_rec"],
+                config["pseudo_weight"],
+                pos_weight,
+                config.get("aki_weight", 1.0),
+                uw,
+            )
+            if torch.isfinite(loss) and loss.requires_grad:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
+                optimizer.step()
+            epoch_losses.append({"loss": float(loss.detach()), **parts})
+        scheduler.step()
+
+        if epoch % config["eval_every"] == 0 or epoch == 1:
+            val_prob = score_indices(
+                model,
+                fold_data.x_filled,
+                fold_data.input_missing,
+                edge_index,
+                edge_attr,
+                val_idx,
+                config["batch_size"],
+            )
+            y_val = fold_data.y[torch.as_tensor(val_idx, device=device)].cpu().numpy()
+            val_auc = safe_auroc(y_val, val_prob)
+
+            if config.get("wandb") and HAS_WANDB:
+                log_d = {
+                    f"fold{fold}/loss": np.mean([d["loss"] for d in epoch_losses]),
+                    f"fold{fold}/loss_rec": np.mean([d["rec"] for d in epoch_losses]),
+                    f"fold{fold}/loss_aki": np.mean([d["aki"] for d in epoch_losses]),
+                    f"fold{fold}/val_auroc": val_auc,
+                    "epoch": epoch,
+                }
+                if uw:
+                    log_d[f"fold{fold}/sigma_rec"] = float(
+                        torch.exp(0.5 * uw.log_var_rec)
+                    )
+                    log_d[f"fold{fold}/sigma_aki"] = float(
+                        torch.exp(0.5 * uw.log_var_aki)
+                    )
+                wandb.log(log_d, step=epoch)
+
+            if np.isfinite(val_auc) and val_auc > best_val:
+                best_val, best_epoch = val_auc, epoch
+                best_state = copy.deepcopy(model.state_dict())
+                patience_left = config["patience"]
+            else:
+                patience_left -= 1
+
+            if config.get("verbose"):
+                print(
+                    f"    ep={epoch:04d} val={val_auc:.4f} best={best_val:.4f} pat={patience_left}"
+                )
+            if patience_left <= 0:
+                break
+
+    model.load_state_dict(best_state)
+    return best_val, best_epoch
+
+
+# ──────────────────────────────────────────────────────────────
+#  Strategy: PRETRAIN → FINETUNE (GraphMAE recipe)
+# ──────────────────────────────────────────────────────────────
+
+
+def _pretrain_encoder(
+    model, fold_data, edge_index, edge_attr, non_aki_mask_f, config, device, fold
+):
+    """Phase 1: train encoder+decoder on L_rec only. All patients, no AKI loss."""
+    N = fold_data.x_filled.size(0)
+    fit_idx = np.arange(N)
+    pt_epochs = config.get("pretrain_epochs", 200)
+
+    # Only optimize encoder + decoder params (not AKI heads)
+    enc_dec_params = (
+        list(model.encoder.parameters())
+        + list(model.dec1.parameters())
+        + list(model.dec2.parameters())
+        + list(model.recon_head.parameters())
+        + list(model.node_emb.parameters())
+    )
+    optimizer = torch.optim.AdamW(
+        enc_dec_params, lr=config["lr"], weight_decay=config["weight_decay"]
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=pt_epochs)
+
+    for epoch in range(1, pt_epochs + 1):
+        model.train()
+        for bi in iter_batches(fit_idx, config["batch_size"], shuffle=True):
+            x_b, miss_b = denoise_batch(
+                fold_data.x_filled,
+                fold_data.input_missing,
+                fold_data.observed_mask,
+                bi,
+                non_aki_mask_f,
+                config["mask_rate"],
+            )
+            out = model(x_b, edge_index, edge_attr, miss_b)
+            loss = compute_rec_only_loss(
+                out, bi, fold_data, non_aki_mask_f, config["pseudo_weight"]
+            )
+            if torch.isfinite(loss) and loss.requires_grad:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(enc_dec_params, config["grad_clip"])
+                optimizer.step()
+        scheduler.step()
+
+        if config.get("wandb") and HAS_WANDB and (epoch % 20 == 0 or epoch == 1):
+            wandb.log(
+                {f"fold{fold}/pretrain_rec": float(loss.detach()), "epoch": epoch},
+                step=epoch,
+            )
+        if config.get("verbose") and epoch % 50 == 0:
+            print(f"    pretrain ep={epoch:04d} rec={float(loss.detach()):.4f}")
+
+
+def _finetune_head(
+    model,
+    fold_data,
+    edge_index,
+    edge_attr,
+    train_idx,
+    val_idx,
+    non_aki_mask_f,
+    config,
+    device,
+    fold,
+):
+    """Phase 2: freeze encoder, train only the AKI head."""
+    N = fold_data.x_filled.size(0)
+    train_indicator = torch.zeros(N, dtype=torch.bool, device=device)
+    train_indicator[torch.as_tensor(train_idx, device=device)] = True
+
+    y_train = fold_data.y[torch.as_tensor(train_idx, device=device)]
+    pos_weight = (
+        (y_train == 0).sum().float() / (y_train == 1).sum().float().clamp_min(1)
+    ).clamp(max=config["max_pos_weight"])
+
+    # Freeze encoder + decoder
+    for p in model.encoder.parameters():
+        p.requires_grad = False
+    for p in model.dec1.parameters():
+        p.requires_grad = False
+    for p in model.dec2.parameters():
+        p.requires_grad = False
+    for p in model.recon_head.parameters():
+        p.requires_grad = False
+    for p in model.node_emb.parameters():
+        p.requires_grad = False
+
+    # Only AKI head params
+    head_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(
+        head_params, lr=config["lr"] * 0.5, weight_decay=config["weight_decay"]
+    )
+    ft_epochs = config.get("finetune_epochs", 300)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=ft_epochs)
+
+    best_val, best_epoch, best_state = -np.inf, -1, copy.deepcopy(model.state_dict())
+    patience_left = config["patience"]
+
+    for epoch in range(1, ft_epochs + 1):
+        model.train()  # head layers need train mode for dropout
+        for bi in iter_batches(train_idx, config["batch_size"], shuffle=True):
+            x_b = fold_data.x_filled[torch.as_tensor(bi, device=device)]
+            miss_b = fold_data.input_missing[torch.as_tensor(bi, device=device)]
+            out = model(x_b, edge_index, edge_attr, miss_b)
+            ce_mask = train_indicator[torch.as_tensor(bi, device=device)]
+            y = fold_data.y[torch.as_tensor(bi, device=device)]
+            loss = F.binary_cross_entropy_with_logits(
+                out.aki_logits[ce_mask], y[ce_mask], pos_weight=pos_weight
+            )
+            if torch.isfinite(loss):
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+        scheduler.step()
+
+        if epoch % config["eval_every"] == 0 or epoch == 1:
+            val_prob = score_indices(
+                model,
+                fold_data.x_filled,
+                fold_data.input_missing,
+                edge_index,
+                edge_attr,
+                val_idx,
+                config["batch_size"],
+            )
+            y_val = fold_data.y[torch.as_tensor(val_idx, device=device)].cpu().numpy()
+            val_auc = safe_auroc(y_val, val_prob)
+
+            if config.get("wandb") and HAS_WANDB:
+                wandb.log(
+                    {
+                        f"fold{fold}/ft_aki_loss": float(loss.detach()),
+                        f"fold{fold}/ft_val_auroc": val_auc,
+                        "epoch": epoch,
+                    },
+                    step=epoch + config.get("pretrain_epochs", 200),
+                )
+
+            if np.isfinite(val_auc) and val_auc > best_val:
+                best_val, best_epoch = val_auc, epoch
+                best_state = copy.deepcopy(model.state_dict())
+                patience_left = config["patience"]
+            else:
+                patience_left -= 1
+
+            if config.get("verbose"):
+                print(
+                    f"    finetune ep={epoch:04d} val={val_auc:.4f} best={best_val:.4f}"
+                )
+            if patience_left <= 0:
+                break
+
+    model.load_state_dict(best_state)
+    # Unfreeze everything for potential further use
+    for p in model.parameters():
+        p.requires_grad = True
+    return best_val, best_epoch
+
+
+# ──────────────────────────────────────────────────────────────
+#  Strategy: EMBED → XGBoost
+# ──────────────────────────────────────────────────────────────
+
+
+def _embed_xgb(
+    model,
+    fold_data,
+    edge_index,
+    edge_attr,
+    train_idx,
+    test_idx,
+    num_features,
+    aki_idx,
+    config,
+    device,
+):
+    """Extract GNN embeddings, concat with raw features, train XGBoost."""
+    # Extract embeddings for all patients
     model.eval()
     N = fold_data.x_filled.size(0)
-    dev = fold_data.x_filled.device
-    missing_non_aki = (~fold_data.observed_mask) & non_aki_mask_f.unsqueeze(0).to(dev)
-    for batch_idx in iter_batches(np.arange(N), batch_size=batch_size, shuffle=False):
-        idx = torch.as_tensor(batch_idx, dtype=torch.long, device=dev)
-        out = model(
-            fold_data.x_filled[idx],
-            edge_index=edge_index,
-            edge_attr=edge_attr,
-            missing_mask=fold_data.input_missing[idx],
+    all_embs = []
+    for bi in iter_batches(np.arange(N), config["batch_size"], shuffle=False):
+        idx = torch.as_tensor(bi, dtype=torch.long, device=device)
+        emb = model.extract_embeddings(
+            fold_data.x_filled[idx], edge_index, edge_attr, fold_data.input_missing[idx]
         )
-        m = missing_non_aki[idx]
-        if m.any():
-            new_vals = out.x_hat.detach()
-            fold_data.x_filled[idx] = torch.where(m, new_vals, fold_data.x_filled[idx])
-            fold_data.x_target[idx] = torch.where(m, new_vals, fold_data.x_target[idx])
+        all_embs.append(emb)
+    emb_all = np.concatenate(all_embs)  # [N, 2*latent]
+
+    # Concat [embeddings ‖ raw features]
+    non_aki = [i for i in range(num_features) if i != aki_idx]
+    X_raw = fold_data.x_filled[:, non_aki].cpu().numpy()
+    X_aug = np.concatenate([X_raw, emb_all], axis=1)
+
+    y_np = fold_data.y.cpu().numpy()
+
+    try:
+        from xgboost import XGBClassifier
+
+        n_pos = y_np[train_idx].sum()
+        n_neg = len(train_idx) - n_pos
+        xgb = XGBClassifier(
+            n_estimators=300,
+            max_depth=4,
+            learning_rate=0.1,
+            scale_pos_weight=max(1, n_neg / max(1, n_pos)),
+            eval_metric="logloss",
+            verbosity=0,
+            random_state=config["seed"],
+        )
+        xgb.fit(X_aug[train_idx], y_np[train_idx])
+        prob = xgb.predict_proba(X_aug[test_idx])[:, 1]
+        auc = safe_auroc(y_np[test_idx], prob)
+        auprc = safe_auprc(y_np[test_idx], prob)
+    except ImportError:
+        # Fallback to LogReg
+        lr = LogisticRegression(max_iter=5000, class_weight="balanced", C=1.0)
+        lr.fit(X_aug[train_idx], y_np[train_idx])
+        prob = lr.predict_proba(X_aug[test_idx])[:, 1]
+        auc = safe_auroc(y_np[test_idx], prob)
+        auprc = safe_auprc(y_np[test_idx], prob)
+
+    return auc, auprc
 
 
 # ──────────────────────────────────────────────────────────────
-#  Single fold
+#  Single fold (dispatches to strategy)
 # ──────────────────────────────────────────────────────────────
 
 
@@ -411,14 +698,11 @@ def train_one_fold(
         binary_mask_f,
         train_idx,
         aki_idx,
-        impute_strategy=config["impute_strategy"],
-        use_label_input=config["use_label_input"],
+        config["impute_strategy"],
+        config["use_label_input"],
     )
-    fold_data.x_filled = fold_data.x_filled.to(device)
-    fold_data.x_target = fold_data.x_target.to(device)
-    fold_data.observed_mask = fold_data.observed_mask.to(device)
-    fold_data.input_missing = fold_data.input_missing.to(device)
-    fold_data.y = fold_data.y.to(device)
+    for attr in ("x_filled", "x_target", "observed_mask", "input_missing", "y"):
+        setattr(fold_data, attr, getattr(fold_data, attr).to(device))
 
     edge_index, edge_weight = make_graph_for_fold(
         config, fold_data, train_idx, aki_idx, data_dir
@@ -441,160 +725,90 @@ def train_one_fold(
         conv_type=config["conv_type"],
         aki_mode=config["aki_mode"],
         add_self_loops=config["add_self_loops"],
+        drop_edge_rate=config.get("drop_edge_rate", 0.0),
     ).to(device)
 
-    y_train = fold_data.y[torch.as_tensor(train_idx, device=device)]
-    n_pos = (y_train == 1).sum().float().clamp_min(1.0)
-    n_neg = (y_train == 0).sum().float().clamp_min(1.0)
-    pos_weight = (n_neg / n_pos).clamp(max=config["max_pos_weight"])
+    strategy = config["strategy"]
 
-    train_indicator = torch.zeros(X_nf.shape[0], dtype=torch.bool, device=device)
-    train_indicator[torch.as_tensor(train_idx, device=device)] = True
+    # ── Dispatch ─────────────────────────────────────────────
+    if strategy == "joint":
+        best_val, best_epoch = _train_joint(
+            fold,
+            model,
+            fold_data,
+            edge_index,
+            edge_attr,
+            train_idx,
+            val_idx,
+            non_aki_mask_f,
+            config,
+            device,
+        )
 
-    # Transductive (default): reconstruct all patients.
-    # Strict: only train patients contribute gradients.
-    fit_idx = np.arange(X_nf.shape[0]) if not config["strict_recon"] else train_idx
+    elif strategy == "pretrain_finetune":
+        _pretrain_encoder(
+            model,
+            fold_data,
+            edge_index,
+            edge_attr,
+            non_aki_mask_f,
+            config,
+            device,
+            fold,
+        )
+        best_val, best_epoch = _finetune_head(
+            model,
+            fold_data,
+            edge_index,
+            edge_attr,
+            train_idx,
+            val_idx,
+            non_aki_mask_f,
+            config,
+            device,
+            fold,
+        )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"]
-    )
+    elif strategy == "embed_xgb":
+        _pretrain_encoder(
+            model,
+            fold_data,
+            edge_index,
+            edge_attr,
+            non_aki_mask_f,
+            config,
+            device,
+            fold,
+        )
+        emb_auc, emb_auprc = _embed_xgb(
+            model,
+            fold_data,
+            edge_index,
+            edge_attr,
+            train_idx,
+            test_idx,
+            num_features,
+            aki_idx,
+            config,
+            device,
+        )
+        # For embed_xgb: no GNN test eval, XGB IS the test result
+        lr_auc, lr_auprc, xgb_auc, xgb_auprc = run_baselines(
+            fold_data, train_idx, test_idx, num_features, aki_idx, config
+        )
+        return {
+            "fold": fold,
+            "auroc": emb_auc,
+            "auprc": emb_auprc,
+            "best_val_auroc": float("nan"),
+            "best_epoch": -1,
+            "logreg_auroc": lr_auc,
+            "logreg_auprc": lr_auprc,
+            "xgb_auroc": xgb_auc,
+            "xgb_auprc": xgb_auprc,
+        }
 
-    # Linear warmup → cosine decay (stabilizes the first 5-20 epochs)
-    warmup_ep = config.get("warmup_epochs", 20)
-
-    def lr_lambda(epoch):
-        if epoch < warmup_ep:
-            return max(0.1, epoch / warmup_ep)  # ramp from 10% to 100%
-        progress = (epoch - warmup_ep) / max(1, config["epochs"] - warmup_ep)
-        return max(0.01, 0.5 * (1 + np.cos(np.pi * progress)))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    # EMA for stable evaluation
-    ema_decay = config.get("ema_decay", 0.0)
-    ema_state = None
-    if ema_decay > 0:
-        ema_state = {k: v.clone() for k, v in model.state_dict().items()}
-
-    best_val = -np.inf
-    best_epoch = -1
-    best_state = copy.deepcopy(model.state_dict())
-    patience_left = config["patience"]
-    history: List[Dict] = []
-
-    for epoch in range(1, config["epochs"] + 1):
-        model.train()
-        epoch_losses = []
-        for batch_idx in iter_batches(
-            fit_idx, batch_size=config["batch_size"], shuffle=True
-        ):
-            x_b, miss_b = denoise_batch(
-                fold_data.x_filled,
-                fold_data.input_missing,
-                fold_data.observed_mask,
-                batch_idx,
-                non_aki_mask_f,
-                config["mask_rate"],
-            )
-            out = model(
-                x_b, edge_index=edge_index, edge_attr=edge_attr, missing_mask=miss_b
-            )
-            loss, parts = compute_loss(
-                out,
-                batch_idx,
-                fold_data,
-                train_indicator,
-                non_aki_mask_f,
-                config["lambda_rec"],
-                config["pseudo_weight"],
-                pos_weight,
-                config.get("aki_weight", 1.0),
-            )
-            if not torch.isfinite(loss):
-                raise RuntimeError(f"Non-finite loss fold={fold} epoch={epoch}")
-            if loss.requires_grad and loss.item() != 0.0:
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
-                optimizer.step()
-                # EMA update
-                if ema_state is not None:
-                    with torch.no_grad():
-                        for k, v in model.state_dict().items():
-                            ema_state[k].mul_(ema_decay).add_(v, alpha=1 - ema_decay)
-            epoch_losses.append({"loss": float(loss.detach()), **parts})
-
-        scheduler.step()
-
-        if config["impute_every"] > 0 and epoch % config["impute_every"] == 0:
-            update_missing_from_recon(
-                model,
-                fold_data,
-                edge_index,
-                edge_attr,
-                non_aki_mask_f,
-                config["batch_size"],
-            )
-
-        if epoch % config["eval_every"] == 0 or epoch == 1:
-            # Swap in EMA weights for evaluation if enabled
-            if ema_state is not None:
-                live_state = {k: v.clone() for k, v in model.state_dict().items()}
-                model.load_state_dict(ema_state)
-
-            val_prob = score_indices(
-                model,
-                fold_data.x_filled,
-                fold_data.input_missing,
-                edge_index,
-                edge_attr,
-                val_idx,
-                config["batch_size"],
-            )
-            y_val = fold_data.y[torch.as_tensor(val_idx, device=device)].cpu().numpy()
-            val_auc = safe_auroc(y_val, val_prob)
-            mean_loss = float(np.mean([d["loss"] for d in epoch_losses]))
-            mean_rec = float(np.mean([d["rec"] for d in epoch_losses]))
-            mean_aki = float(np.mean([d["aki"] for d in epoch_losses]))
-            history.append({"epoch": epoch, "val_auroc": val_auc, "loss": mean_loss})
-
-            if config.get("wandb") and HAS_WANDB:
-                wandb.log(
-                    {
-                        f"fold{fold}/loss": mean_loss,
-                        f"fold{fold}/loss_rec": mean_rec,
-                        f"fold{fold}/loss_aki": mean_aki,
-                        f"fold{fold}/val_auroc": val_auc,
-                        f"fold{fold}/lr": scheduler.get_last_lr()[0],
-                        "epoch": epoch,
-                    },
-                    step=epoch,
-                )
-
-            if np.isfinite(val_auc) and val_auc > best_val:
-                best_val, best_epoch = val_auc, epoch
-                # Save EMA weights as best (or live if no EMA)
-                best_state = copy.deepcopy(
-                    ema_state if ema_state is not None else model.state_dict()
-                )
-                patience_left = config["patience"]
-            else:
-                patience_left -= 1
-
-            # Swap back to live weights for continued training
-            if ema_state is not None:
-                model.load_state_dict(live_state)
-
-            if config.get("verbose"):
-                print(
-                    f"    ep={epoch:04d} loss={mean_loss:.4f} val={val_auc:.4f} "
-                    f"best={best_val:.4f} pat={patience_left}"
-                )
-            if patience_left <= 0:
-                break
-
-    # ── Test ──────────────────────────────────────────────────
-    model.load_state_dict(best_state)
+    # ── Test eval (for joint and pretrain_finetune) ──────────
     test_prob = score_indices(
         model,
         fold_data.x_filled,
@@ -608,42 +822,9 @@ def train_one_fold(
     test_auc = safe_auroc(y_test, test_prob)
     test_auprc = safe_auprc(y_test, test_prob)
 
-    # Same-fold baselines (exact same preprocessing)
-    non_aki = [i for i in range(num_features) if i != aki_idx]
-    X_bl = fold_data.x_filled[:, non_aki].cpu().numpy()
-    y_np = fold_data.y.cpu().numpy()
-
-    # LogReg
-    lr = LogisticRegression(
-        max_iter=5000, class_weight="balanced", C=config["logreg_C"]
+    lr_auc, lr_auprc, xgb_auc, xgb_auprc = run_baselines(
+        fold_data, train_idx, test_idx, num_features, aki_idx, config
     )
-    lr.fit(X_bl[train_idx], y_np[train_idx])
-    lr_prob = lr.predict_proba(X_bl[test_idx])[:, 1]
-    lr_auc = safe_auroc(y_np[test_idx], lr_prob)
-    lr_auprc = safe_auprc(y_np[test_idx], lr_prob)
-
-    # XGBoost
-    xgb_auc, xgb_auprc = float("nan"), float("nan")
-    try:
-        from xgboost import XGBClassifier
-
-        n_pos_np = y_np[train_idx].sum()
-        n_neg_np = len(train_idx) - n_pos_np
-        xgb = XGBClassifier(
-            n_estimators=200,
-            max_depth=4,
-            learning_rate=0.1,
-            scale_pos_weight=max(1, n_neg_np / max(1, n_pos_np)),
-            eval_metric="logloss",
-            verbosity=0,
-            random_state=config["seed"],
-        )
-        xgb.fit(X_bl[train_idx], y_np[train_idx])
-        xgb_prob = xgb.predict_proba(X_bl[test_idx])[:, 1]
-        xgb_auc = safe_auroc(y_np[test_idx], xgb_prob)
-        xgb_auprc = safe_auprc(y_np[test_idx], xgb_prob)
-    except ImportError:
-        pass
 
     return {
         "fold": fold,
@@ -655,10 +836,6 @@ def train_one_fold(
         "logreg_auprc": lr_auprc,
         "xgb_auroc": xgb_auc,
         "xgb_auprc": xgb_auprc,
-        "n_train": len(train_idx),
-        "n_val": len(val_idx),
-        "n_test": len(test_idx),
-        "history": history,
     }
 
 
@@ -696,60 +873,43 @@ def run_cv(config):
     surv_days = meta["surv_days"].values
     eligible = (y_all == 1) | (surv_days >= config["landmark_days"])
     eligible_idx = np.where(eligible)[0]
-
     X_fn = X_fn[:, eligible_idx]
     missing_fn = missing_fn[:, eligible_idx]
     y_all = y_all[eligible_idx]
-
-    # Patient × feature layout
     X_nf = X_fn.T.contiguous()
     missing_nf = missing_fn.T.contiguous()
 
-    recon_mode = "transductive" if not config["strict_recon"] else "strict"
-
-    # For reweight mode: use "recon" architecture but scale ℒ_AKI
-    effective_aki_mode = config["aki_mode"]
-    if effective_aki_mode == "reweight":
-        config["aki_mode"] = "recon"  # same architecture as pure recon
-        if config.get("aki_weight", 1.0) <= 1.0:
-            config["aki_weight"] = 58.0
-            print(
-                f"  Auto-set aki_weight={config['aki_weight']:.0f} (gradient balance)"
-            )
-
     print("=" * 72)
-    print("Feature-graph AE:  L = λ·L_rec + α·L_AKI")
+    print(
+        f"Feature-graph AE | strategy={config['strategy']} | aki_mode={config['aki_mode']}"
+    )
     print("=" * 72)
-    print(f"Device: {device}")
-    print(f"Data: N={X_nf.shape[0]}, F={X_nf.shape[1]}, AKI rate={y_all.mean():.3f}")
     print(
-        f"Landmark: {eligible.sum()}/{len(eligible)} eligible ({config['landmark_days']}d)"
+        f"Device: {device}  N={X_nf.shape[0]}  F={X_nf.shape[1]}  AKI={y_all.mean():.3f}"
     )
     print(
-        f"Graph: {config['edge_method']} k={config['k']} edge_wt={config.get('use_edge_weights', False)} "
-        f"conv={config['conv_type']} L={config['layers']} self_loops={config['add_self_loops']}"
+        f"Graph: {config['edge_method']} k={config['k']} conv={config['conv_type']} "
+        f"L={config['layers']} drop_edge={config.get('drop_edge_rate', 0)}"
     )
     print(
-        f"Loss: λ_rec={config['lambda_rec']} α_aki={config.get('aki_weight', 1.0)} "
-        f"mask={config['mask_rate']} pseudo={config['pseudo_weight']}"
-    )
-    print(
-        f"Mode: recon={recon_mode} aki={effective_aki_mode} label_input={config['use_label_input']}"
+        f"Loss: λ={config['lambda_rec']} α={config.get('aki_weight', 1.0)} "
+        f"uw={config.get('uw', False)} mask={config['mask_rate']}"
     )
 
-    # ── W&B ───────────────────────────────────────────────────
     if config.get("wandb") and HAS_WANDB:
         run_name = config.get("run_name") or (
-            f"gae_{config['edge_method']}_{effective_aki_mode}"
-            f"_l{config['layers']}_lam{config['lambda_rec']:g}"
+            f"{config['strategy']}_{config['aki_mode']}_l{config['layers']}_lam{config['lambda_rec']:g}"
         )
-        # Log original aki_mode (not the rewritten one)
-        wb_config = {**config, "aki_mode": effective_aki_mode}
         wandb.init(
             project=config.get("wandb_project", "dualr-graph"),
             name=run_name,
-            config=wb_config,
-            tags=[effective_aki_mode, config["edge_method"], config["conv_type"]],
+            config=config,
+            tags=[
+                config["strategy"],
+                config["aki_mode"],
+                config["edge_method"],
+                config["conv_type"],
+            ],
             reinit=True,
         )
 
@@ -759,20 +919,20 @@ def run_cv(config):
     fold_metrics = []
 
     for fold, (trainval_idx, test_idx) in enumerate(
-        outer.split(np.zeros(len(y_all)), y_all), start=1
+        outer.split(np.zeros(len(y_all)), y_all), 1
     ):
         inner = StratifiedKFold(
             n_splits=5, shuffle=True, random_state=config["seed"] + fold
         )
-        inner_train_rel, val_rel = next(
+        tr_rel, va_rel = next(
             inner.split(np.zeros(len(trainval_idx)), y_all[trainval_idx])
         )
-        train_idx = trainval_idx[inner_train_rel]
-        val_idx = trainval_idx[val_rel]
+        train_idx, val_idx = trainval_idx[tr_rel], trainval_idx[va_rel]
         print(
             f"\nFold {fold}/{config['cv_folds']}: train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}"
         )
 
+        t0 = time.time()
         metrics = train_one_fold(
             fold,
             config,
@@ -786,73 +946,54 @@ def run_cv(config):
             data_dir,
             device,
         )
+        metrics["time_s"] = time.time() - t0
         fold_metrics.append(metrics)
+
+        has_xgb = np.isfinite(metrics.get("xgb_auroc", float("nan")))
         print(
             f"  GNN  AUROC={metrics['auroc']:.4f}  AUPRC={metrics['auprc']:.4f}  "
-            f"best_val={metrics['best_val_auroc']:.4f}  ep={metrics['best_epoch']}"
+            f"ep={metrics.get('best_epoch', -1)}"
         )
-        print(
-            f"  LR   AUROC={metrics['logreg_auroc']:.4f}  AUPRC={metrics['logreg_auprc']:.4f}"
-        )
-        if np.isfinite(metrics.get("xgb_auroc", float("nan"))):
-            print(
-                f"  XGB  AUROC={metrics['xgb_auroc']:.4f}  AUPRC={metrics['xgb_auprc']:.4f}"
-            )
+        print(f"  LR   AUROC={metrics['logreg_auroc']:.4f}")
+        if has_xgb:
+            print(f"  XGB  AUROC={metrics['xgb_auroc']:.4f}")
 
-    aurocs = np.array([m["auroc"] for m in fold_metrics], dtype=float)
-    auprcs = np.array([m["auprc"] for m in fold_metrics], dtype=float)
-    lr_aurocs = np.array([m["logreg_auroc"] for m in fold_metrics], dtype=float)
-    xgb_aurocs = np.array(
-        [m.get("xgb_auroc", float("nan")) for m in fold_metrics], dtype=float
-    )
-    has_xgb = np.any(np.isfinite(xgb_aurocs))
+    aurocs = np.array([m["auroc"] for m in fold_metrics])
+    auprcs = np.array([m["auprc"] for m in fold_metrics])
+    lr_aurocs = np.array([m["logreg_auroc"] for m in fold_metrics])
+    xgb_aurocs = np.array([m.get("xgb_auroc", float("nan")) for m in fold_metrics])
+    has_xgb_any = np.any(np.isfinite(xgb_aurocs))
 
     summary = {
-        "aki_mode": effective_aki_mode,
+        "strategy": config["strategy"],
+        "aki_mode": config["aki_mode"],
         "auroc_mean": float(np.nanmean(aurocs)),
         "auroc_std": float(np.nanstd(aurocs)),
         "auprc_mean": float(np.nanmean(auprcs)),
         "auprc_std": float(np.nanstd(auprcs)),
         "logreg_auroc_mean": float(np.nanmean(lr_aurocs)),
-        "logreg_auroc_std": float(np.nanstd(lr_aurocs)),
         "delta_vs_logreg": float(np.nanmean(aurocs - lr_aurocs)),
         "folds": fold_metrics,
-        "config": {**config, "aki_mode": effective_aki_mode},
+        "config": config,
     }
-    if has_xgb:
+    if has_xgb_any:
         summary["xgb_auroc_mean"] = float(np.nanmean(xgb_aurocs))
-        summary["xgb_auroc_std"] = float(np.nanstd(xgb_aurocs))
         summary["delta_vs_xgb"] = float(np.nanmean(aurocs - xgb_aurocs))
 
     print(f"\n{'='*72}")
     print(f"GNN  AUROC: {summary['auroc_mean']:.4f} ± {summary['auroc_std']:.4f}")
-    print(f"GNN  AUPRC: {summary['auprc_mean']:.4f} ± {summary['auprc_std']:.4f}")
-    print(
-        f"LR   AUROC: {summary['logreg_auroc_mean']:.4f} ± {summary['logreg_auroc_std']:.4f}"
-    )
-    if has_xgb:
-        print(
-            f"XGB  AUROC: {summary['xgb_auroc_mean']:.4f} ± {summary['xgb_auroc_std']:.4f}"
-        )
+    print(f"LR   AUROC: {summary['logreg_auroc_mean']:.4f}")
+    if has_xgb_any:
+        print(f"XGB  AUROC: {summary['xgb_auroc_mean']:.4f}")
     print(f"Δ vs LR:    {summary['delta_vs_logreg']:+.4f}")
-    if has_xgb:
+    if has_xgb_any:
         print(f"Δ vs XGB:   {summary['delta_vs_xgb']:+.4f}")
     print(f"{'='*72}")
 
     if config.get("wandb") and HAS_WANDB:
-        wb_summary = {
-            "auroc_mean": summary["auroc_mean"],
-            "auroc_std": summary["auroc_std"],
-            "auprc_mean": summary["auprc_mean"],
-            "auprc_std": summary["auprc_std"],
-            "logreg_auroc_mean": summary["logreg_auroc_mean"],
-            "delta_vs_logreg": summary["delta_vs_logreg"],
-        }
-        if has_xgb:
-            wb_summary["xgb_auroc_mean"] = summary["xgb_auroc_mean"]
-            wb_summary["delta_vs_xgb"] = summary["delta_vs_xgb"]
-        wandb.summary.update(wb_summary)
-
+        wandb.summary.update(
+            {k: v for k, v in summary.items() if k != "folds" and k != "config"}
+        )
         cols = ["fold", "auroc", "auprc", "logreg_auroc", "xgb_auroc", "best_epoch"]
         table = wandb.Table(columns=cols)
         for m in fold_metrics:
@@ -862,7 +1003,7 @@ def run_cv(config):
                 m["auprc"],
                 m["logreg_auroc"],
                 m.get("xgb_auroc", float("nan")),
-                m["best_epoch"],
+                m.get("best_epoch", -1),
             )
         wandb.log({"fold_results": table})
         wandb.finish()
@@ -877,8 +1018,6 @@ def run_cv(config):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Feature-graph AE for ICI→AKI")
-
-    # Data
     p.add_argument("--data_dir", default="data")
     p.add_argument("--run_name", default=None)
     p.add_argument("--edge_method", default="llm", choices=["llm", "spearman", "mi"])
@@ -886,11 +1025,18 @@ def parse_args():
     p.add_argument("--use_edge_weights", action="store_true")
     p.add_argument("--cv_cutoff", type=float, default=None)
 
+    # Strategy
+    p.add_argument(
+        "--strategy",
+        default="joint",
+        choices=["joint", "pretrain_finetune", "embed_xgb"],
+    )
+
     # Architecture
     p.add_argument(
         "--conv_type", default="gatv2", choices=["gcn", "gat", "gatv2", "transformer"]
     )
-    p.add_argument("--layers", type=int, default=3, choices=[2, 3])
+    p.add_argument("--layers", type=int, default=2)
     p.add_argument("--node_emb_dim", type=int, default=8)
     p.add_argument("--hidden", type=int, default=64)
     p.add_argument("--latent", type=int, default=32)
@@ -898,67 +1044,40 @@ def parse_args():
     p.add_argument("--dropout", type=float, default=0.15)
     p.add_argument("--add_self_loops", action="store_true", default=True)
     p.add_argument("--no_self_loops", dest="add_self_loops", action="store_false")
+    p.add_argument("--drop_edge_rate", type=float, default=0.1)
 
-    # AKI prediction mode
+    # AKI mode
     p.add_argument(
-        "--aki_mode",
-        default="recon_split",
-        choices=["recon", "recon_split", "dual", "reweight"],
-        help="recon=shared head, recon_split=separate AKI Linear, "
-        "dual=encoder MLP head, reweight=recon + scaled ℒ_AKI",
-    )
-    p.add_argument(
-        "--aki_weight",
-        type=float,
-        default=1.0,
-        help="Multiplier on ℒ_AKI (used with --aki_mode=reweight, "
-        "set to ~58 to balance gradient ratio)",
+        "--aki_mode", default="dual", choices=["recon", "recon_split", "dual", "pooled"]
     )
 
     # Loss
     p.add_argument("--lambda_rec", type=float, default=0.5)
+    p.add_argument("--aki_weight", type=float, default=1.0)
     p.add_argument("--mask_rate", type=float, default=0.20)
     p.add_argument("--pseudo_weight", type=float, default=0.05)
-
-    # Semi-supervised defaults (whiteboard design)
     p.add_argument(
-        "--strict_recon",
-        action="store_true",
-        default=False,
-        help="Ablation: only train patients in L_rec (default: transductive)",
+        "--uw", action="store_true", help="Uncertainty weighting (Kendall 2018)"
     )
+    p.add_argument("--strict_recon", action="store_true", default=False)
     p.add_argument(
-        "--no_label_input",
-        dest="use_label_input",
-        action="store_false",
-        default=True,
-        help="Ablation: do not feed train AKI labels as input (default: labels visible)",
+        "--no_label_input", dest="use_label_input", action="store_false", default=True
     )
 
     # Training
     p.add_argument("--impute_strategy", default="mean", choices=["mean", "median"])
-    p.add_argument("--impute_every", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--epochs", type=int, default=500)
+    p.add_argument("--pretrain_epochs", type=int, default=200)
+    p.add_argument("--finetune_epochs", type=int, default=300)
     p.add_argument("--patience", type=int, default=40)
     p.add_argument("--eval_every", type=int, default=5)
     p.add_argument("--batch_size", type=int, default=512)
     p.add_argument("--grad_clip", type=float, default=5.0)
+    p.add_argument("--warmup_epochs", type=int, default=20)
     p.add_argument("--max_pos_weight", type=float, default=10.0)
     p.add_argument("--logreg_C", type=float, default=1.0)
-    p.add_argument(
-        "--warmup_epochs",
-        type=int,
-        default=20,
-        help="Linear LR warmup epochs (stabilizes early training)",
-    )
-    p.add_argument(
-        "--ema_decay",
-        type=float,
-        default=0.0,
-        help="EMA decay for evaluation (0=off, 0.999=slow avg)",
-    )
 
     # Infra
     p.add_argument("--cv_folds", type=int, default=5)
@@ -966,7 +1085,7 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--verbose", action="store_true")
-    p.add_argument("--wandb", action="store_true", help="Log to Weights & Biases")
+    p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb_project", default="dualr-graph")
     return p.parse_args()
 
@@ -978,12 +1097,11 @@ def main():
     os.makedirs("results", exist_ok=True)
     name = (
         args.run_name
-        or f"gae_{args.edge_method}_k{args.k}_l{args.layers}_lam{args.lambda_rec:g}"
+        or f"{args.strategy}_{args.aki_mode}_{args.edge_method}_l{args.layers}_lam{args.lambda_rec:g}"
     )
-    out = os.path.join("results", f"{name}.json")
-    with open(out, "w") as f:
+    with open(os.path.join("results", f"{name}.json"), "w") as f:
         json.dump(summary, f, indent=2)
-    print(f"Saved: {out}")
+    print(f"Saved: results/{name}.json")
 
 
 if __name__ == "__main__":
