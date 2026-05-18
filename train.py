@@ -45,6 +45,13 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
+try:
+    import wandb
+
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
+
 from graph import build_mi, build_spearman, knn_sparsify, load_llm_graph
 from models import build_model
 
@@ -521,7 +528,22 @@ def train_one_fold(
             y_val = fold_data.y[torch.as_tensor(val_idx, device=device)].cpu().numpy()
             val_auc = safe_auroc(y_val, val_prob)
             mean_loss = float(np.mean([d["loss"] for d in epoch_losses]))
+            mean_rec = float(np.mean([d["rec"] for d in epoch_losses]))
+            mean_aki = float(np.mean([d["aki"] for d in epoch_losses]))
             history.append({"epoch": epoch, "val_auroc": val_auc, "loss": mean_loss})
+
+            if config.get("wandb") and HAS_WANDB:
+                wandb.log(
+                    {
+                        f"fold{fold}/loss": mean_loss,
+                        f"fold{fold}/loss_rec": mean_rec,
+                        f"fold{fold}/loss_aki": mean_aki,
+                        f"fold{fold}/val_auroc": val_auc,
+                        f"fold{fold}/lr": scheduler.get_last_lr()[0],
+                        "epoch": epoch,
+                    },
+                    step=epoch,
+                )
 
             if np.isfinite(val_auc) and val_auc > best_val:
                 best_val, best_epoch = val_auc, epoch
@@ -645,6 +667,19 @@ def run_cv(config):
         f"Mode: recon={recon_mode} aki={aki_mode} label_input={config['use_label_input']}"
     )
 
+    # ── W&B ───────────────────────────────────────────────────
+    if config.get("wandb") and HAS_WANDB:
+        run_name = (
+            config.get("run_name")
+            or f"gae_{config['edge_method']}_l{config['layers']}_lam{config['lambda_rec']:g}"
+        )
+        wandb.init(
+            project=config.get("wandb_project", "dualr-graph"),
+            name=run_name,
+            config=config,
+            reinit=True,
+        )
+
     outer = StratifiedKFold(
         n_splits=config["cv_folds"], shuffle=True, random_state=config["seed"]
     )
@@ -711,6 +746,28 @@ def run_cv(config):
     )
     print(f"Δ AUROC:    {summary['delta_vs_logreg']:+.4f}")
     print(f"{'='*72}")
+
+    if config.get("wandb") and HAS_WANDB:
+        wandb.summary.update(
+            {
+                "auroc_mean": summary["auroc_mean"],
+                "auroc_std": summary["auroc_std"],
+                "auprc_mean": summary["auprc_mean"],
+                "auprc_std": summary["auprc_std"],
+                "logreg_auroc_mean": summary["logreg_auroc_mean"],
+                "delta_vs_logreg": summary["delta_vs_logreg"],
+            }
+        )
+        # Per-fold test metrics as a wandb table
+        cols = ["fold", "auroc", "auprc", "logreg_auroc", "best_epoch"]
+        table = wandb.Table(columns=cols)
+        for m in fold_metrics:
+            table.add_data(
+                m["fold"], m["auroc"], m["auprc"], m["logreg_auroc"], m["best_epoch"]
+            )
+        wandb.log({"fold_results": table})
+        wandb.finish()
+
     return summary
 
 
@@ -789,6 +846,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--verbose", action="store_true")
+    p.add_argument("--wandb", action="store_true", help="Log to Weights & Biases")
+    p.add_argument("--wandb_project", default="dualr-graph")
     return p.parse_args()
 
 
