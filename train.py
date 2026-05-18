@@ -458,9 +458,23 @@ def train_one_fold(
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"]
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config["epochs"]
-    )
+
+    # Linear warmup → cosine decay (stabilizes the first 5-20 epochs)
+    warmup_ep = config.get("warmup_epochs", 20)
+
+    def lr_lambda(epoch):
+        if epoch < warmup_ep:
+            return max(0.1, epoch / warmup_ep)  # ramp from 10% to 100%
+        progress = (epoch - warmup_ep) / max(1, config["epochs"] - warmup_ep)
+        return max(0.01, 0.5 * (1 + np.cos(np.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # EMA for stable evaluation
+    ema_decay = config.get("ema_decay", 0.0)
+    ema_state = None
+    if ema_decay > 0:
+        ema_state = {k: v.clone() for k, v in model.state_dict().items()}
 
     best_val = -np.inf
     best_epoch = -1
@@ -503,6 +517,11 @@ def train_one_fold(
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
                 optimizer.step()
+                # EMA update
+                if ema_state is not None:
+                    with torch.no_grad():
+                        for k, v in model.state_dict().items():
+                            ema_state[k].mul_(ema_decay).add_(v, alpha=1 - ema_decay)
             epoch_losses.append({"loss": float(loss.detach()), **parts})
 
         scheduler.step()
@@ -518,6 +537,11 @@ def train_one_fold(
             )
 
         if epoch % config["eval_every"] == 0 or epoch == 1:
+            # Swap in EMA weights for evaluation if enabled
+            if ema_state is not None:
+                live_state = {k: v.clone() for k, v in model.state_dict().items()}
+                model.load_state_dict(ema_state)
+
             val_prob = score_indices(
                 model,
                 fold_data.x_filled,
@@ -549,10 +573,17 @@ def train_one_fold(
 
             if np.isfinite(val_auc) and val_auc > best_val:
                 best_val, best_epoch = val_auc, epoch
-                best_state = copy.deepcopy(model.state_dict())
+                # Save EMA weights as best (or live if no EMA)
+                best_state = copy.deepcopy(
+                    ema_state if ema_state is not None else model.state_dict()
+                )
                 patience_left = config["patience"]
             else:
                 patience_left -= 1
+
+            # Swap back to live weights for continued training
+            if ema_state is not None:
+                model.load_state_dict(live_state)
 
             if config.get("verbose"):
                 print(
@@ -916,6 +947,18 @@ def parse_args():
     p.add_argument("--grad_clip", type=float, default=5.0)
     p.add_argument("--max_pos_weight", type=float, default=10.0)
     p.add_argument("--logreg_C", type=float, default=1.0)
+    p.add_argument(
+        "--warmup_epochs",
+        type=int,
+        default=20,
+        help="Linear LR warmup epochs (stabilizes early training)",
+    )
+    p.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.0,
+        help="EMA decay for evaluation (0=off, 0.999=slow avg)",
+    )
 
     # Infra
     p.add_argument("--cv_folds", type=int, default=5)
