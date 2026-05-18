@@ -113,7 +113,7 @@ def evaluate(model, x_input, edge_index, aki_idx, y_test, test_idx, edge_attr=No
     """AUROC + AUPRC on held-out patients (transductive: slice by test_idx)."""
     model.eval()
     with torch.no_grad():
-        x_recon, _ = model(x_input, edge_index, edge_attr=edge_attr)
+        x_recon, _ = model(x_input, edge_index, edge_attr=edge_attr, aki_idx=aki_idx)
         probs = torch.sigmoid(x_recon[aki_idx, test_idx]).cpu().numpy()
     y = y_test.cpu().numpy()
     if len(np.unique(y)) < 2:
@@ -183,7 +183,7 @@ def train_one_fold(
 
     for epoch in range(config["epochs"]):
         model.train()
-        x_recon, z = model(x_input, edge_index, edge_attr=edge_attr)
+        x_recon, z = model(x_input, edge_index, edge_attr=edge_attr, aki_idx=aki_idx)
 
         loss, recon_l, ce_l = compute_loss(
             x_full,

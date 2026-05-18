@@ -32,8 +32,16 @@ class GraphAE(nn.Module):
         self.hidden = hidden
         self.latent = latent
         self.dropout = dropout
-        # Decoder: latent → reconstructed input
+        # Shared decoder for reconstruction (non-AKI nodes)
         self.decoder = nn.Sequential(
+            nn.Linear(latent, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, in_channels),
+        )
+        # Dedicated AKI classifier — separate weights so AKI prediction
+        # doesn't compete with heterogeneous feature reconstruction
+        self.aki_head = nn.Sequential(
             nn.Linear(latent, hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -43,9 +51,12 @@ class GraphAE(nn.Module):
     def encode(self, x, edge_index, edge_attr=None):
         raise NotImplementedError
 
-    def forward(self, x, edge_index, edge_attr=None):
+    def forward(self, x, edge_index, edge_attr=None, aki_idx=None):
         z = self.encode(x, edge_index, edge_attr)
         x_recon = self.decoder(z)
+        if aki_idx is not None:
+            x_recon = x_recon.clone()
+            x_recon[aki_idx] = self.aki_head(z[aki_idx])
         return x_recon, z
 
     def get_attention(self, x, edge_index, edge_attr=None):
