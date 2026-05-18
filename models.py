@@ -1,242 +1,336 @@
 #!/usr/bin/env python3
 """
-models.py — Feature-graph risk model.
+models.py — Feature-graph autoencoder for ICI-AKI prediction.
 
-Architecture (per GPT diagnosis):
-  Encoder: GATv2 on feature graph → z [F, latent] (node embeddings)
-  Risk decoder: β_i = MLP(z_i, z_AKI) → logit_p = b + Σ β_i * x_ip
-  Skip: raw logistic regression β_skip·x (guarantees ≥ LogReg baseline)
+Core idea
+---------
+X is an [N, K] patient-feature matrix.  The graph G is over K feature nodes.
+Each patient row x_i is a graph signal on the feature network.  The model
+reconstructs X and predicts AKI:
 
-Key insight: the decoder must produce PATIENT-LEVEL logits via a SHARED
-classifier (β·x), NOT via Linear(latent, N_patients). The old decoder
-had one output neuron per patient ID — test patients got zero gradient.
+    L = lambda_rec * L_rec(X_hat, X) + L_AKI(P_AKI, y_AKI)
 
-The learned β_i are directly interpretable alongside the attention heatmap.
+AKI prediction is the AKI node's reconstruction: sigma(X_hat[:, aki_idx]).
+No separate classification head — the decoder must learn AKI through the
+graph structure.  A --separate_aki_head ablation flag exists for comparison.
+
+Inductive over patients: new rows can be scored without retraining.
+
+Architecture ref: SiGra (Song et al. 2023, Nat Comms), GATE (Salehi 2019).
 """
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as Fnn
-from torch_geometric.nn import GATv2Conv
+import torch.nn.functional as F
+from torch_geometric.nn import GATv2Conv, TransformerConv
 
-# ══════════════════════════════════════════════════════════════
-# Risk decoder: graph embeddings → per-feature weights → patient logits
-# ══════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────
+#  Helpers
+# ──────────────────────────────────────────────────────────────
 
 
-class FeatureGraphRiskDecoder(nn.Module):
-    """
-    Shared risk decoder.
+@dataclass
+class ModelOutput:
+    x_hat: torch.Tensor  # [B, F], reconstruction values (all nodes)
+    aki_logits: torch.Tensor  # [B], AKI logits (from recon or separate head)
+    z: torch.Tensor  # [B, F, latent]
 
-    For each non-AKI feature i:
-      β_i = MLP(concat(z_i, z_AKI))    ← weight from graph embedding
-    For each patient p:
-      logit_p = bias + Σ_i β_i * x_ip  ← weighted sum of feature values
 
-    This restores patient exchangeability: logit depends on patient's
-    FEATURE VALUES, not their column index in the tensor.
-    """
+def _repeat_graph(
+    edge_index: torch.Tensor,
+    num_graphs: int,
+    num_nodes: int,
+) -> torch.Tensor:
+    """Repeat one feature graph into B disconnected patient copies."""
+    if num_graphs == 1:
+        return edge_index
+    edge_index = edge_index.long()
+    num_edges = edge_index.size(1)
+    offsets = (
+        torch.arange(num_graphs, device=edge_index.device)
+        .repeat_interleave(num_edges)
+        .mul(num_nodes)
+    )
+    return edge_index.repeat(1, num_graphs) + offsets.unsqueeze(0)
 
-    def __init__(self, latent, hidden=32):
+
+def _repeat_edge_attr(
+    edge_attr: Optional[torch.Tensor], num_graphs: int
+) -> Optional[torch.Tensor]:
+    if edge_attr is None:
+        return None
+    if edge_attr.dim() == 1:
+        edge_attr = edge_attr.unsqueeze(-1)
+    return edge_attr.repeat(num_graphs, 1)
+
+
+# ──────────────────────────────────────────────────────────────
+#  Graph conv block
+# ──────────────────────────────────────────────────────────────
+
+
+class GraphBlock(nn.Module):
+    """GATv2 or TransformerConv block with LayerNorm + ELU + dropout."""
+
+    def __init__(
+        self,
+        conv_type: str,
+        in_dim: int,
+        out_dim: int,
+        heads: int,
+        concat: bool,
+        dropout: float,
+        edge_dim: Optional[int],
+        add_self_loops: bool = True,
+    ) -> None:
         super().__init__()
-        self.beta_mlp = nn.Sequential(
-            nn.Linear(2 * latent, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, 1),
-        )
-        self.bias = nn.Parameter(torch.zeros(()))
+        conv_type = conv_type.lower()
+        if conv_type == "gatv2":
+            self.conv = GATv2Conv(
+                in_dim,
+                out_dim,
+                heads=heads,
+                concat=concat,
+                dropout=dropout,
+                edge_dim=edge_dim,
+                add_self_loops=add_self_loops,
+                fill_value=1.0,  # self-loop edge weight
+                residual=True,
+            )
+        elif conv_type == "transformer":
+            self.conv = TransformerConv(
+                in_dim,
+                out_dim,
+                heads=heads,
+                concat=concat,
+                dropout=dropout,
+                edge_dim=edge_dim,
+                beta=True,
+            )
+        else:
+            raise ValueError(f"Unknown conv_type={conv_type!r}")
 
-    def forward(self, z, x, aki_idx):
-        """
-        Args:
-            z: [F, latent] node embeddings from encoder
-            x: [F, N] feature matrix (with AKI row)
-            aki_idx: int
-        Returns:
-            logits: [N] patient-level AKI logits
-            beta: [F-1] learned per-feature weights
-        """
-        F_nodes = z.size(0)
-        feat_idx = [i for i in range(F_nodes) if i != aki_idx]
+        actual_out = out_dim * heads if concat else out_dim
+        self.norm = nn.LayerNorm(actual_out)
+        self.dropout = float(dropout)
 
-        z_feat = z[feat_idx]  # [F-1, latent]
-        z_aki = z[aki_idx].unsqueeze(0).expand_as(z_feat)  # [F-1, latent]
-
-        # Per-feature weight from graph embeddings
-        beta = self.beta_mlp(torch.cat([z_feat, z_aki], dim=1)).squeeze(-1)  # [F-1]
-
-        # Patient logits = weighted sum of features
-        x_feat = x[feat_idx, :]  # [F-1, N]
-        logits = self.bias + beta @ x_feat  # [N]
-
-        return logits, beta
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x = self.conv(x, edge_index, edge_attr=edge_attr)
+        x = self.norm(x)
+        x = F.elu(x)
+        return F.dropout(x, p=self.dropout, training=self.training)
 
 
-# ══════════════════════════════════════════════════════════════
-# Encoder: GATv2 on feature graph
-# ══════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────
+#  Main model
+# ──────────────────────────────────────────────────────────────
 
 
-class FeatureGraphRiskModel(nn.Module):
+class FeatureGraphAE(nn.Module):
     """
-    Feature-graph risk model with LogReg skip connection.
+    Patient-as-graph-signal feature-graph autoencoder.
 
-    logit_p = raw_skip(x_p) + GAT_risk(z, x_p)
+    Default: AKI prediction = sigma(x_hat[:, aki_idx])  (reconstruction).
+    Ablation: AKI prediction = MLP(z_aki, z_pool)       (separate head).
 
-    The raw_skip ensures the model can match LogReg baseline immediately.
-    The GAT path learns graph-structured residual signal.
+    Parameters
+    ----------
+    num_features : K feature nodes including AKI
+    aki_idx      : column index of AKI in the feature matrix
+    layers       : GNN depth, 2 or 3
+    use_recon_aki: True = AKI logit from decoder reconstruction (whiteboard)
+                   False = AKI logit from separate MLP head (ablation)
     """
 
     def __init__(
         self,
-        num_features,
-        aki_idx,
-        hidden=32,
-        latent=16,
-        heads=2,
-        dropout=0.1,
-        edge_dim=None,
-    ):
+        num_features: int,
+        aki_idx: int,
+        node_emb_dim: int = 8,
+        hidden: int = 64,
+        latent: int = 32,
+        heads: int = 4,
+        layers: int = 3,
+        dropout: float = 0.15,
+        edge_dim: Optional[int] = 1,
+        conv_type: str = "gatv2",
+        use_recon_aki: bool = True,
+        add_self_loops: bool = True,
+    ) -> None:
         super().__init__()
-        self.num_features = num_features
-        self.aki_idx = aki_idx
-        self.non_aki = [i for i in range(num_features) if i != aki_idx]
+        if layers not in (2, 3):
+            raise ValueError("layers must be 2 or 3")
 
-        # ── GATv2 encoder ─────────────────────────────────────
-        # in_channels = N (patient values per feature node)
-        # Set dynamically in forward() via lazy init or pass explicitly
-        self.conv1 = None  # lazy init on first forward
-        self.conv2 = None
-        self.norm1 = None
-        self.hidden = hidden
-        self.latent = latent
-        self.heads = heads
-        self.dropout = dropout
-        self.edge_dim = edge_dim
-        self._encoder_built = False
+        self.num_features = int(num_features)
+        self.aki_idx = int(aki_idx)
+        self.use_recon_aki = use_recon_aki
+        self.node_emb = nn.Embedding(num_features, node_emb_dim)
 
-        # ── Risk decoder ──────────────────────────────────────
-        self.risk_decoder = FeatureGraphRiskDecoder(latent, hidden)
+        # Node input = value(1) + missing_flag(1) + aki_flag(1) + emb
+        in_dim = 1 + 1 + 1 + node_emb_dim
 
-        # ── Raw LogReg skip (no graph needed) ─────────────────
-        self.raw_skip = nn.Linear(num_features - 1, 1, bias=True)
+        # ── Encoder ──────────────────────────────────────────────
+        enc_blocks = []
+        current = in_dim
+        for layer_idx in range(layers):
+            is_last = layer_idx == layers - 1
+            out_dim = latent if is_last else hidden
+            out_heads = 1 if is_last else heads
+            concat = not is_last
+            enc_blocks.append(
+                GraphBlock(
+                    conv_type=conv_type,
+                    in_dim=current,
+                    out_dim=out_dim,
+                    heads=out_heads,
+                    concat=concat,
+                    dropout=dropout,
+                    edge_dim=edge_dim,
+                    add_self_loops=add_self_loops,
+                )
+            )
+            current = out_dim * out_heads if concat else out_dim
+        self.encoder = nn.ModuleList(enc_blocks)
 
-        # ── Optional: masked feature reconstruction head ──────
-        self.recon_head = nn.Linear(latent, 1)
-
-    def _build_encoder(self, in_channels):
-        """Lazy encoder init — called on first forward with actual N."""
-        device = self.raw_skip.weight.device
-        self.conv1 = GATv2Conv(
-            in_channels,
-            self.hidden,
-            heads=self.heads,
+        # ── GNN Decoder (SiGra-style) ────────────────────────────
+        self.dec1 = GraphBlock(
+            conv_type=conv_type,
+            in_dim=latent,
+            out_dim=hidden,
+            heads=heads,
             concat=True,
-            dropout=self.dropout,
-            edge_dim=self.edge_dim,
-            add_self_loops=False,
-            residual=True,
-        ).to(device)
-        self.norm1 = nn.LayerNorm(self.hidden * self.heads).to(device)
-        self.conv2 = GATv2Conv(
-            self.hidden * self.heads,
-            self.latent,
+            dropout=dropout,
+            edge_dim=edge_dim,
+            add_self_loops=add_self_loops,
+        )
+        self.dec2 = GraphBlock(
+            conv_type=conv_type,
+            in_dim=hidden * heads,
+            out_dim=hidden,
             heads=1,
             concat=False,
-            dropout=self.dropout,
-            edge_dim=self.edge_dim,
-            add_self_loops=False,
-            residual=True,
-        ).to(device)
-        self._encoder_built = True
+            dropout=dropout,
+            edge_dim=edge_dim,
+            add_self_loops=add_self_loops,
+        )
+        self.recon_head = nn.Linear(hidden, 1)
 
-    def encode(self, x, edge_index, edge_attr=None):
-        """x: [F, N] → z: [F, latent]"""
-        if not self._encoder_built:
-            self._build_encoder(x.size(1))
-        ea = edge_attr if self.edge_dim else None
-        h = self.conv1(x, edge_index, edge_attr=ea)
-        h = self.norm1(h)
-        h = Fnn.elu(h)
-        h = Fnn.dropout(h, p=self.dropout, training=self.training)
-        z = self.conv2(h, edge_index, edge_attr=ea)
-        return z
+        # ── Separate AKI head (ablation only) ────────────────────
+        self.aki_head = nn.Sequential(
+            nn.Linear(latent * 2, hidden),
+            nn.ELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
 
-    def forward(self, x, edge_index, edge_attr=None):
-        """
-        Args:
-            x: [F, N] feature matrix (AKI row present but zeroed externally)
-            edge_index: [2, E]
-            edge_attr: [E, 1] optional edge weights
-        Returns:
-            logits: [N] patient-level AKI logits
-            beta: [F-1] learned feature weights from graph
-            recon: [F, N] optional reconstruction for masked feature modeling
-        """
+    def _make_node_input(
+        self,
+        x: torch.Tensor,
+        missing_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """x: [B, F] → [B*F, in_dim]"""
+        batch_size, num_features = x.shape
+        device = x.device
+        node_ids = torch.arange(num_features, device=device).repeat(batch_size)
+        values = x.reshape(batch_size * num_features, 1)
+
+        if missing_mask is None:
+            miss = torch.zeros_like(values)
+        else:
+            miss = missing_mask.reshape(batch_size * num_features, 1).float()
+
+        is_aki = (node_ids == self.aki_idx).float().unsqueeze(-1)
+        emb = self.node_emb(node_ids)
+        return torch.cat([values, miss, is_aki, emb], dim=-1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: Optional[torch.Tensor] = None,
+        missing_mask: Optional[torch.Tensor] = None,
+    ) -> ModelOutput:
+        batch_size, num_features = x.shape
+        edge_index_b = _repeat_graph(edge_index.to(x.device), batch_size, num_features)
+        edge_attr_b = _repeat_edge_attr(
+            edge_attr.to(x.device) if edge_attr is not None else None,
+            batch_size,
+        )
+
         # Encode
-        z = self.encode(x, edge_index, edge_attr)  # [F, latent]
+        h = self._make_node_input(x, missing_mask)
+        for block in self.encoder:
+            h = block(h, edge_index_b, edge_attr_b)
 
-        # Risk decoder: graph-derived feature weights
-        gat_logits, beta = self.risk_decoder(z, x, self.aki_idx)  # [N], [F-1]
+        z = h.view(batch_size, num_features, -1)  # [B, F, latent]
 
-        # Raw LogReg skip: direct path from features to prediction
-        x_non_aki = x[self.non_aki, :].T  # [N, F-1]
-        skip_logits = self.raw_skip(x_non_aki).squeeze(-1)  # [N]
+        # Decode (GNN decoder → scalar per node)
+        d = self.dec1(h, edge_index_b, edge_attr_b)
+        d = self.dec2(d, edge_index_b, edge_attr_b)
+        x_hat = self.recon_head(d).view(batch_size, num_features)
 
-        # Combined logits
-        logits = skip_logits + gat_logits  # [N]
+        # ── AKI logit ────────────────────────────────────────────
+        if self.use_recon_aki:
+            # Whiteboard design: AKI prediction IS the reconstruction
+            aki_logits = x_hat[:, self.aki_idx]
+        else:
+            # Ablation: separate MLP head
+            z_aki = z[:, self.aki_idx, :]
+            z_pool = z.mean(dim=1)
+            aki_logits = self.aki_head(torch.cat([z_aki, z_pool], dim=-1)).squeeze(-1)
 
-        # Optional reconstruction for masked feature modeling
-        recon = self.recon_head(z).squeeze(-1)  # [F]... but we need [F, N]
-        # Actually: recon per node is z[i] → scalar. For masked feature modeling,
-        # we predict masked feature values. This is handled in the loss function.
+        return ModelOutput(x_hat=x_hat, aki_logits=aki_logits, z=z)
 
-        return logits, beta, z
-
-    def get_attention(self, x, edge_index, edge_attr=None):
-        """Extract GATv2 attention weights for heatmap."""
+    @torch.no_grad()
+    def predict_proba(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: Optional[torch.Tensor] = None,
+        missing_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         self.eval()
-        if not self._encoder_built:
-            self._build_encoder(x.size(1))
-        ea = edge_attr if self.edge_dim else None
-        with torch.no_grad():
-            h1, (ei1, aw1) = self.conv1(
-                x,
-                edge_index,
-                edge_attr=ea,
-                return_attention_weights=True,
-            )
-            h1 = self.norm1(h1)
-            h1 = Fnn.elu(h1)
-            _, (ei2, aw2) = self.conv2(
-                h1,
-                edge_index,
-                edge_attr=ea,
-                return_attention_weights=True,
-            )
-        return {
-            "layer1": {"edge_index": ei1.cpu(), "attention": aw1.cpu()},
-            "layer2": {"edge_index": ei2.cpu(), "attention": aw2.cpu()},
-        }
+        return torch.sigmoid(
+            self.forward(x, edge_index, edge_attr, missing_mask).aki_logits
+        )
 
 
 def build_model(
-    num_features=38,
-    aki_idx=37,
-    hidden=32,
-    latent=16,
-    heads=2,
-    dropout=0.1,
-    edge_dim=None,
-    **kwargs,
-):
-    """Factory function."""
-    return FeatureGraphRiskModel(
+    num_features: int = 38,
+    aki_idx: int = 37,
+    node_emb_dim: int = 8,
+    hidden: int = 64,
+    latent: int = 32,
+    heads: int = 4,
+    layers: int = 3,
+    dropout: float = 0.15,
+    edge_dim: Optional[int] = 1,
+    conv_type: str = "gatv2",
+    use_recon_aki: bool = True,
+    add_self_loops: bool = True,
+    **_: Dict,
+) -> FeatureGraphAE:
+    return FeatureGraphAE(
         num_features=num_features,
         aki_idx=aki_idx,
+        node_emb_dim=node_emb_dim,
         hidden=hidden,
         latent=latent,
         heads=heads,
+        layers=layers,
         dropout=dropout,
         edge_dim=edge_dim,
+        conv_type=conv_type,
+        use_recon_aki=use_recon_aki,
+        add_self_loops=add_self_loops,
     )
