@@ -28,6 +28,7 @@ import json
 import os
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as Fnn
 from sklearn.metrics import average_precision_score, roc_auc_score
@@ -75,9 +76,18 @@ def train_one_fold(
     x_input = X.clone()
     x_input[aki_idx, :] = 0.0
 
-    # Fill missing values with 0 initially (will be updated by reconstruction)
+    # Fill missing values with 0 initially
     if missing_mask is not None:
         x_input[missing_mask] = 0.0
+
+    # StandardScaler on non-AKI features: fit on train, transform all
+    from sklearn.preprocessing import StandardScaler
+
+    scaler = StandardScaler()
+    x_np = x_input[non_aki, :].cpu().numpy().T  # [N, F-1]
+    scaler.fit(x_np[train_idx])
+    x_np = scaler.transform(x_np)
+    x_input[non_aki, :] = torch.tensor(x_np.T, dtype=torch.float32, device=device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"]
@@ -204,6 +214,28 @@ def run_cv(config, data_dir="data", wandb_run=None):
     F_nodes, N = X.shape
     aki_idx = feature_names.index("aki_event")
     y_all = X[aki_idx].numpy()
+
+    # ── 6-month landmark filtering ────────────────────────────
+    # Exclude patients with follow-up < 180d and no event
+    # (same filter as analysis.py to match LogReg baseline)
+    meta = pd.read_csv(os.path.join(data_dir, "cohort_meta.csv"))
+    surv_days = meta["surv_days"].values
+    has_event = y_all == 1
+    has_fu_past = surv_days >= 180
+    eligible = has_event | has_fu_past
+    eligible_idx = np.where(eligible)[0]
+
+    X = X[:, eligible_idx]
+    y_all = y_all[eligible_idx]
+    N = len(eligible_idx)
+    print(
+        f"  6-month landmark: {eligible.sum()}/{len(eligible)} eligible "
+        f"(excluded {(~eligible).sum()} early-censored)"
+    )
+
+    # Update missing mask
+    if missing_mask is not None:
+        missing_mask = missing_mask[:, eligible_idx]
 
     # Missing mask
     miss_path = os.path.join(data_dir, "missing_mask.pt")
