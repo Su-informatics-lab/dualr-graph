@@ -109,20 +109,18 @@ def compute_loss(
 # ══════════════════════════════════════════════════════════════
 
 
-def evaluate(model, x_input, edge_index, aki_idx, y_true, edge_attr=None):
-    """AUROC + AUPRC on held-out patients."""
+def evaluate(model, x_input, edge_index, aki_idx, y_test, test_idx, edge_attr=None):
+    """AUROC + AUPRC on held-out patients (transductive: slice by test_idx)."""
     model.eval()
     with torch.no_grad():
         x_recon, _ = model(x_input, edge_index, edge_attr=edge_attr)
-        probs = torch.sigmoid(x_recon[aki_idx]).cpu().numpy()
-    y = y_true.cpu().numpy()
-    valid = ~np.isnan(y)
-    y_v, p_v = y[valid], probs[valid]
-    if len(np.unique(y_v)) < 2:
+        probs = torch.sigmoid(x_recon[aki_idx, test_idx]).cpu().numpy()
+    y = y_test.cpu().numpy()
+    if len(np.unique(y)) < 2:
         return {"auroc": float("nan"), "auprc": float("nan")}
     return {
-        "auroc": roc_auc_score(y_v, p_v),
-        "auprc": average_precision_score(y_v, p_v),
+        "auroc": roc_auc_score(y, probs),
+        "auprc": average_precision_score(y, probs),
     }
 
 
@@ -213,29 +211,15 @@ def train_one_fold(
 
         # Evaluate periodically
         if epoch % config.get("eval_every", 10) == 0:
-            # Build eval input (same x_input with missing filled)
             metrics = evaluate(
                 model,
                 x_input,
                 edge_index,
                 aki_idx,
                 y_test,
+                test_idx,
                 edge_attr=edge_attr,
             )
-            # Fix: evaluate returns probs for ALL patients,
-            # we need only test patients
-            model.eval()
-            with torch.no_grad():
-                xr, _ = model(x_input, edge_index, edge_attr=edge_attr)
-                probs_test = torch.sigmoid(xr[aki_idx, test_idx]).cpu().numpy()
-            yt = y_test.cpu().numpy()
-            if len(np.unique(yt)) >= 2:
-                metrics = {
-                    "auroc": roc_auc_score(yt, probs_test),
-                    "auprc": average_precision_score(yt, probs_test),
-                }
-            else:
-                metrics = {"auroc": float("nan"), "auprc": float("nan")}
 
             if wandb_run is not None:
                 wandb_run.log(
