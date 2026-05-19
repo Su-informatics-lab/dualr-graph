@@ -2,15 +2,10 @@
 """
 models.py — Feature-graph autoencoder for ICI-AKI prediction.
 
-Architecture:  GATv2 encoder on K-node feature graph → GNN decoder.
-AKI prediction: separate head on encoder embeddings (not reconstruction).
-
-Evidence basis (deep research 2026-05-19):
-  - GRAPE (You et al. NeurIPS 2020): separate prediction head, not recon
-  - GraphMAE (Hou et al. KDD 2022): pretrain recon → finetune head
-  - T2G-Former (Yan et al. AAAI 2023): feature graph + readout MLP
-  - INCE (Villaizán-Vallelado et al. Neural Networks 2024): CLS-style pool
-  - No published work uses reconstruction-of-target-node as prediction.
+v3.1 fixes (GPT deep search 2026-05-19):
+  ① Feature-type embedding (binary vs continuous) in node input
+  ② binary_mask buffer for type-aware reconstruction loss
+  ③ AKI query node support (no label leakage by design)
 """
 
 from __future__ import annotations
@@ -21,10 +16,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv, GATv2Conv, GCNConv, TransformerConv
-
-# ──────────────────────────────────────────────────────────────
-#  Helpers
-# ──────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -38,13 +29,13 @@ def _repeat_graph(edge_index, num_graphs, num_nodes):
     if num_graphs == 1:
         return edge_index
     edge_index = edge_index.long()
-    num_edges = edge_index.size(1)
-    offsets = (
+    ne = edge_index.size(1)
+    off = (
         torch.arange(num_graphs, device=edge_index.device)
-        .repeat_interleave(num_edges)
+        .repeat_interleave(ne)
         .mul(num_nodes)
     )
-    return edge_index.repeat(1, num_graphs) + offsets.unsqueeze(0)
+    return edge_index.repeat(1, num_graphs) + off.unsqueeze(0)
 
 
 def _repeat_edge_attr(edge_attr, num_graphs):
@@ -56,18 +47,10 @@ def _repeat_edge_attr(edge_attr, num_graphs):
 
 
 def drop_edge(edge_index, edge_attr, p, training):
-    """DropEdge: randomly remove p fraction of edges during training."""
     if not training or p <= 0:
         return edge_index, edge_attr
     mask = torch.rand(edge_index.size(1), device=edge_index.device) >= p
-    ei = edge_index[:, mask]
-    ea = edge_attr[mask] if edge_attr is not None else None
-    return ei, ea
-
-
-# ──────────────────────────────────────────────────────────────
-#  Graph conv block
-# ──────────────────────────────────────────────────────────────
+    return edge_index[:, mask], (edge_attr[mask] if edge_attr is not None else None)
 
 
 class GraphBlock(nn.Module):
@@ -143,13 +126,8 @@ class GraphBlock(nn.Module):
         return F.dropout(x, p=self.dropout, training=self.training)
 
 
-# ──────────────────────────────────────────────────────────────
-#  Uncertainty weighting (Kendall et al. CVPR 2018)
-# ──────────────────────────────────────────────────────────────
-
-
 class UncertaintyWeighting(nn.Module):
-    """L = (1/2σ²_rec)·L_rec + log(σ_rec) + (1/2σ²_aki)·L_aki + log(σ_aki)"""
+    """Kendall et al. CVPR 2018: learnable task weights via homoscedastic uncertainty."""
 
     def __init__(self):
         super().__init__()
@@ -165,11 +143,6 @@ class UncertaintyWeighting(nn.Module):
             + 0.5 * w_aki * loss_aki
             + 0.5 * self.log_var_aki
         ).squeeze()
-
-
-# ──────────────────────────────────────────────────────────────
-#  Main model
-# ──────────────────────────────────────────────────────────────
 
 
 class FeatureGraphAE(nn.Module):
@@ -207,9 +180,17 @@ class FeatureGraphAE(nn.Module):
         self.aki_idx = int(aki_idx)
         self.aki_mode = aki_mode
         self.drop_edge_rate = drop_edge_rate
-        self.node_emb = nn.Embedding(num_features, node_emb_dim)
 
-        in_dim = 1 + 1 + 1 + node_emb_dim
+        # Fix #4: feature-id + feature-type embeddings
+        self.node_emb = nn.Embedding(num_features, node_emb_dim)
+        self.feat_type_emb = nn.Embedding(2, 4)  # 0=binary, 1=continuous
+        # binary_mask stored via register_binary_mask() after construction
+        self.register_buffer(
+            "_binary_mask", torch.zeros(num_features, dtype=torch.long)
+        )
+
+        # value(1) + missing(1) + aki_flag(1) + id_emb(node_emb_dim) + type_emb(4)
+        in_dim = 1 + 1 + 1 + node_emb_dim + 4
 
         # ── Encoder ──────────────────────────────────────────────
         enc_blocks = []
@@ -244,20 +225,25 @@ class FeatureGraphAE(nn.Module):
         self.recon_head = nn.Linear(hidden, 1)
 
         # ── AKI heads ────────────────────────────────────────────
-        self.aki_recon_head = nn.Linear(hidden, 1)  # recon_split
-        self.aki_head = nn.Sequential(  # dual
+        self.aki_recon_head = nn.Linear(hidden, 1)
+        self.aki_head = nn.Sequential(
             nn.Linear(latent * 2, hidden),
             nn.ELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 1),
         )
-        self.attn_pool = nn.Linear(latent, 1)  # pooled
+        self.attn_pool = nn.Linear(latent, 1)
         self.aki_pool_head = nn.Sequential(
             nn.Linear(latent, hidden),
             nn.ELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 1),
         )
+
+    def register_binary_mask(self, binary_mask):
+        """Call after construction: binary_mask[j]=True if feature j is binary."""
+        # Store as long tensor: 0=binary, 1=continuous (for feat_type_emb)
+        self._binary_mask = (~binary_mask.bool()).long().to(self._binary_mask.device)
 
     def _make_node_input(self, x, missing_mask):
         B, F = x.shape
@@ -270,11 +256,13 @@ class FeatureGraphAE(nn.Module):
             else torch.zeros_like(values)
         )
         is_aki = (node_ids == self.aki_idx).float().unsqueeze(-1)
-        emb = self.node_emb(node_ids)
-        return torch.cat([values, miss, is_aki, emb], dim=-1)
+        id_emb = self.node_emb(node_ids)
+        # Fix #4: feature-type embedding
+        type_ids = self._binary_mask.to(device).repeat(B)  # [B*F]
+        type_emb = self.feat_type_emb(type_ids)  # [B*F, 4]
+        return torch.cat([values, miss, is_aki, id_emb, type_emb], dim=-1)
 
     def encode(self, x, edge_index, edge_attr=None, missing_mask=None):
-        """Returns z [B, F, latent] and batched graph for decoder."""
         B, F = x.shape
         ei = _repeat_graph(edge_index.to(x.device), B, F)
         ea = _repeat_edge_attr(
@@ -287,7 +275,6 @@ class FeatureGraphAE(nn.Module):
         return h.view(B, F, -1), ei, ea
 
     def decode(self, h_flat, ei, ea, B, F):
-        """Returns x_hat [B,F] and d_nodes [B,F,hidden]."""
         d = self.dec1(h_flat, ei, ea)
         d = self.dec2(d, ei, ea)
         d_nodes = d.view(B, F, -1)
@@ -324,7 +311,6 @@ class FeatureGraphAE(nn.Module):
 
     @torch.no_grad()
     def extract_embeddings(self, x, edge_index, edge_attr=None, missing_mask=None):
-        """[B, 2*latent] — z_K ‖ z_pool for two-stage XGBoost."""
         self.eval()
         z, _, _ = self.encode(x, edge_index, edge_attr, missing_mask)
         return torch.cat([z[:, self.aki_idx, :], z.mean(1)], -1).cpu().numpy()

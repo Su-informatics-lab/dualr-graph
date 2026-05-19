@@ -1,31 +1,23 @@
 #!/bin/bash -l
-#SBATCH --job-name=gae_strat
+#SBATCH --job-name=gae_v31
 #SBATCH --account=r01109
 #SBATCH --partition=general
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --time=06:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+#SBATCH --time=08:00:00
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
-#SBATCH --array=0-14
+#SBATCH --array=0-2
 
 # ──────────────────────────────────────────────────────────────
-#  Strategy sweep  (15 jobs)
+#  v3.1 strategy sweep — 6 runs per node × 3 nodes = 18 total
 #
-#  Based on deep research 2026-05-19:
-#    - GRAPE, GraphMAE, T2G-Former: separate head, not recon
-#    - Pretrain→finetune: highest expected impact
-#    - Embed→XGBoost: highest evidence ceiling
+#  Node 0: joint dual × 5 λ + joint+uw dual
+#  Node 1: joint pooled (2) + pretrain_finetune (4)
+#  Node 2: embed_xgb (2) + conv comparison (3) + joint+uw pooled
 #
-#  0-3:   joint       × 4 aki_modes  (dual, pooled, recon_split, recon)
-#  4-5:   joint+uw    × 2 aki_modes  (dual, pooled)
-#  6-9:   pretrain_finetune × 4 aki_modes
-#  10-11: embed_xgb   × 2 pretrain configs (200ep, 400ep)
-#  12-14: joint_dual  × 3 λ_rec values (0, 0.1, 1.0)
-#
-#  All on LLM edge-weighted, gatv2, L=2
 #  Submit:  sbatch slurm/gae_strat.sbatch
 # ──────────────────────────────────────────────────────────────
 
@@ -34,54 +26,49 @@ cd /N/project/depot/hw56/dualreasoning/dualr-graph
 source .venv_cpu/bin/activate
 mkdir -p logs results
 
-IDX=$SLURM_ARRAY_TASK_ID
+RUN() {
+    local NAME=$1; shift
+    echo "[$(date +%H:%M)] START ${NAME}"
+    python train.py --wandb --verbose --run_name "$NAME" \
+        --edge_method llm --use_edge_weights --layers 2 \
+        --hidden 64 --latent 32 --heads 4 \
+        --drop_edge_rate 0.1 --epochs 500 --patience 40 \
+        --warmup_epochs 20 "$@" \
+        > logs/${NAME}.log 2>&1
+    echo "[$(date +%H:%M)] DONE  ${NAME}"
+}
 
-case $IDX in
-    0) STRAT=joint; MODE=dual;        LAM=0.5; EXTRA="" ;;
-    1) STRAT=joint; MODE=pooled;      LAM=0.5; EXTRA="" ;;
-    2) STRAT=joint; MODE=recon_split; LAM=0.5; EXTRA="" ;;
-    3) STRAT=joint; MODE=recon;       LAM=0.5; EXTRA="" ;;
-    4) STRAT=joint; MODE=dual;        LAM=0.5; EXTRA="--uw" ;;
-    5) STRAT=joint; MODE=pooled;      LAM=0.5; EXTRA="--uw" ;;
-    6) STRAT=pretrain_finetune; MODE=dual;        LAM=0.5; EXTRA="" ;;
-    7) STRAT=pretrain_finetune; MODE=pooled;      LAM=0.5; EXTRA="" ;;
-    8) STRAT=pretrain_finetune; MODE=recon_split; LAM=0.5; EXTRA="" ;;
-    9) STRAT=pretrain_finetune; MODE=dual;        LAM=1.0; EXTRA="" ;;
-   10) STRAT=embed_xgb; MODE=dual; LAM=0.5; EXTRA="--pretrain_epochs 200" ;;
-   11) STRAT=embed_xgb; MODE=dual; LAM=0.5; EXTRA="--pretrain_epochs 400" ;;
-   12) STRAT=joint; MODE=dual; LAM=0;   EXTRA="" ;;
-   13) STRAT=joint; MODE=dual; LAM=0.1; EXTRA="" ;;
-   14) STRAT=joint; MODE=dual; LAM=1.0; EXTRA="" ;;
+case $SLURM_ARRAY_TASK_ID in
+0)
+    echo "═══ Node 0: joint dual × 5λ + uw ═══"
+    RUN joint_dual_lam0       --strategy joint --aki_mode dual --lambda_rec 0     &
+    RUN joint_dual_lam0.017   --strategy joint --aki_mode dual --lambda_rec 0.017 &
+    RUN joint_dual_lam0.1     --strategy joint --aki_mode dual --lambda_rec 0.1   &
+    RUN joint_dual_lam0.5     --strategy joint --aki_mode dual --lambda_rec 0.5   &
+    RUN joint_dual_lam1.0     --strategy joint --aki_mode dual --lambda_rec 1.0   &
+    RUN joint_dual_uw_lam0.5  --strategy joint --aki_mode dual --lambda_rec 0.5 --uw &
+    wait
+    ;;
+1)
+    echo "═══ Node 1: pooled + pretrain_finetune ═══"
+    RUN joint_pooled_lam0.017  --strategy joint --aki_mode pooled --lambda_rec 0.017 &
+    RUN joint_pooled_lam0.5    --strategy joint --aki_mode pooled --lambda_rec 0.5   &
+    RUN pf_dual_lam0.5         --strategy pretrain_finetune --aki_mode dual --lambda_rec 0.5         &
+    RUN pf_pooled_lam0.5       --strategy pretrain_finetune --aki_mode pooled --lambda_rec 0.5       &
+    RUN pf_recon_split_lam0.5  --strategy pretrain_finetune --aki_mode recon_split --lambda_rec 0.5  &
+    RUN pf_dual_lam1.0         --strategy pretrain_finetune --aki_mode dual --lambda_rec 1.0         &
+    wait
+    ;;
+2)
+    echo "═══ Node 2: embed_xgb + conv comparison + uw_pooled ═══"
+    RUN embed_xgb_200ep        --strategy embed_xgb --aki_mode dual --lambda_rec 0.5 --pretrain_epochs 200 &
+    RUN embed_xgb_400ep        --strategy embed_xgb --aki_mode dual --lambda_rec 0.5 --pretrain_epochs 400 &
+    RUN joint_dual_gat_lam0.017       --strategy joint --aki_mode dual --lambda_rec 0.017 --conv_type gat         &
+    RUN joint_dual_gcn_lam0.017       --strategy joint --aki_mode dual --lambda_rec 0.017 --conv_type gcn         &
+    RUN joint_dual_transformer_lam0.017 --strategy joint --aki_mode dual --lambda_rec 0.017 --conv_type transformer &
+    RUN joint_pooled_uw_lam0.5 --strategy joint --aki_mode pooled --lambda_rec 0.5 --uw &
+    wait
+    ;;
 esac
 
-NAME="${STRAT}_${MODE}_lam${LAM}"
-[ -n "$EXTRA" ] && NAME="${NAME}_$(echo $EXTRA | tr ' ' '_' | tr -d '-')"
-
-echo "═══════════════════════════════════════════════"
-echo "  Job ${IDX}: ${NAME}"
-echo "  strategy=${STRAT} aki_mode=${MODE} λ=${LAM} ${EXTRA}"
-echo "  $(date)"
-echo "═══════════════════════════════════════════════"
-
-python train.py \
-    --strategy "$STRAT" \
-    --aki_mode "$MODE" \
-    --edge_method llm \
-    --use_edge_weights \
-    --conv_type gatv2 \
-    --k 8 \
-    --lambda_rec "$LAM" \
-    --layers 2 \
-    --hidden 64 \
-    --latent 32 \
-    --heads 4 \
-    --drop_edge_rate 0.1 \
-    --epochs 500 \
-    --patience 40 \
-    --warmup_epochs 20 \
-    --wandb \
-    --verbose \
-    --run_name "$NAME" \
-    $EXTRA
-
-echo "Done: ${NAME} $(date)"
+echo "═══ All done on node $SLURM_ARRAY_TASK_ID $(date) ═══"
