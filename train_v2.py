@@ -576,6 +576,7 @@ def train_one_fold(
         use_vgae=config["use_vgae"],
         use_laplacian_pe=config["use_laplacian_pe"],
         pe_dim=config.get("pe_dim", 16),
+        use_dir_conv=config["use_dir_conv"],
     ).to(device)
 
     # Register LapPE if enabled
@@ -784,6 +785,8 @@ def run_cv(config):
         enhancements.append("vgae")
     if config["use_laplacian_pe"]:
         enhancements.append("lappe")
+    if config["use_dir_conv"]:
+        enhancements.append("dirconv")
     enh_str = "+".join(enhancements) if enhancements else "baseline"
 
     print("=" * 72)
@@ -992,6 +995,11 @@ def parse_args():
     )
     p.add_argument(
         "--use_laplacian_pe", action="store_true", help="Laplacian Positional Encoding"
+    )
+    p.add_argument(
+        "--use_dir_conv",
+        action="store_true",
+        help="DirGNNConv wrapper for directed edges (Rossi et al. LoG 2023)",
     )
     p.add_argument("--pe_dim", type=int, default=16)
     # CV
