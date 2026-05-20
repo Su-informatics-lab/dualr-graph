@@ -23,7 +23,13 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATv2Conv, GCNConv, TransformerConv, global_mean_pool
+from torch_geometric.nn import (
+    DirGNNConv,
+    GATv2Conv,
+    GCNConv,
+    TransformerConv,
+    global_mean_pool,
+)
 
 # ── Dataclass ────────────────────────────────────────────────
 
@@ -73,14 +79,27 @@ def compute_laplacian_pe(
 
 
 class GraphBlock(nn.Module):
-    def __init__(self, conv_type, in_dim, out_dim, heads, concat, dropout, edge_dim):
+    def __init__(
+        self,
+        conv_type,
+        in_dim,
+        out_dim,
+        heads,
+        concat,
+        dropout,
+        edge_dim,
+        use_dir_conv=False,
+    ):
         super().__init__()
         self.conv_type = conv_type.lower()
+        self.use_dir_conv = use_dir_conv
+
+        # Build base conv
         if self.conv_type == "gcn":
-            self.conv = GCNConv(in_dim, out_dim, normalize=True)
+            base_conv = GCNConv(in_dim, out_dim, normalize=True)
             actual_out = out_dim
         elif self.conv_type == "gatv2":
-            self.conv = GATv2Conv(
+            base_conv = GATv2Conv(
                 in_dim,
                 out_dim,
                 heads=heads,
@@ -91,7 +110,7 @@ class GraphBlock(nn.Module):
             )
             actual_out = out_dim * heads if concat else out_dim
         elif self.conv_type == "graph_transformer":
-            self.conv = TransformerConv(
+            base_conv = TransformerConv(
                 in_dim,
                 out_dim,
                 heads=heads,
@@ -103,12 +122,23 @@ class GraphBlock(nn.Module):
             actual_out = out_dim * heads if concat else out_dim
         else:
             raise ValueError(f"Unknown conv_type={self.conv_type!r}")
+
+        # Wrap with DirGNNConv for direction-aware message passing
+        if use_dir_conv:
+            self.conv = DirGNNConv(base_conv)
+        else:
+            self.conv = base_conv
+
         self.norm = nn.LayerNorm(actual_out)
         self.dropout = float(dropout)
         self.actual_out = actual_out
 
     def forward(self, x, edge_index, edge_attr=None):
-        if self.conv_type == "gcn":
+        if self.use_dir_conv:
+            # DirGNNConv handles direction splitting internally;
+            # pass edge_attr only for non-GCN (GCN uses edge_weight kwarg)
+            x = self.conv(x, edge_index)
+        elif self.conv_type == "gcn":
             ew = edge_attr.squeeze(-1) if edge_attr is not None else None
             x = self.conv(x, edge_index, edge_weight=ew)
         else:
@@ -209,6 +239,7 @@ class FeatureGraphAutoencoderV2(nn.Module):
         use_vgae: bool = False,
         use_laplacian_pe: bool = False,
         pe_dim: int = 16,
+        use_dir_conv: bool = False,  # DirGNNConv wrapper (Rossi et al. LoG 2023)
     ):
         super().__init__()
         self.n_features = n_features
@@ -242,7 +273,16 @@ class FeatureGraphAutoencoderV2(nn.Module):
             oh = 1 if is_last else n_heads
             cc = not is_last
             blocks.append(
-                GraphBlock(encoder_type, current, od, oh, cc, dropout, edge_dim)
+                GraphBlock(
+                    encoder_type,
+                    current,
+                    od,
+                    oh,
+                    cc,
+                    dropout,
+                    edge_dim,
+                    use_dir_conv=use_dir_conv,
+                )
             )
             current = blocks[-1].actual_out
         self.encoder = nn.ModuleList(blocks)
@@ -374,6 +414,7 @@ def build_model(
     use_vgae: bool = False,
     use_laplacian_pe: bool = False,
     pe_dim: int = 16,
+    use_dir_conv: bool = False,
     **_,
 ) -> FeatureGraphAutoencoderV2:
     return FeatureGraphAutoencoderV2(
@@ -392,4 +433,5 @@ def build_model(
         use_vgae=use_vgae,
         use_laplacian_pe=use_laplacian_pe,
         pe_dim=pe_dim,
+        use_dir_conv=use_dir_conv,
     )
