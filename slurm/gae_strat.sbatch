@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=gae_v4
+#SBATCH --job-name=gae_v4.1
 #SBATCH --account=r01109
 #SBATCH --partition=general
 #SBATCH --nodes=1
@@ -64,7 +64,7 @@ elif [ $IDX -lt 27 ]; then
     CONV=${CONV_ALTS[$c_idx]}
     AKI_MODE="pooled"
     LATENT=32
-    NAME="v4_llm_${CONV}_l2_la1.0"
+    NAME="v4.1_llm_${CONV}_l2_la1.0"
     EXTRA="--use_edge_weights"
 
 elif [ $IDX -lt 29 ]; then
@@ -89,7 +89,7 @@ else
     CONV="gatv2"
     AKI_MODE="pooled"
     LATENT=${LATENT_ALTS[$lat_idx]}
-    NAME="v4_llm_lat${LATENT}_l2_la1.0"
+    NAME="v4.1_llm_lat${LATENT}_l2_la1.0"
     EXTRA="--use_edge_weights"
 fi
 
