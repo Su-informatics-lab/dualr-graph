@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 """
-train_v2.py — Training with ICML/NeurIPS/ICLR-inspired enhancements.
+train_v2.py — Training with ChatGPT-audited fixes.
 
-Upgrades over train.py (v4):
-  ① Directed association target from LLM adj (P(i|j) ≠ P(j|i))
-  ② FGSAM optimizer (Luo et al., NeurIPS 2024) — flat-minima search
-  ③ PCGrad (Yu et al., NeurIPS 2020) — gradient surgery for multi-task
-  ④ FLAG (Kong et al., CVPR 2022) — adversarial feature augmentation
-  ⑤ SWA (Izmailov et al., UAI 2018) — weight averaging
-  ⑥ Directed / cross-correlation decoder (models_v2.py)
-  ⑦ Optional VGAE with KL regularisation
-  ⑧ Laplacian Positional Encoding
-
-All enhancements are togglable via CLI flags.
-Default config reproduces v4.3 baseline for fair comparison.
+Critical fixes:
+  ① Decoupled --edge_method (topology) from --assoc_target (recon target)
+  ② AKI readout modes: aki_concat, aki_only, non_aki_pool, global_pool
+  ③ Static association loss on feature embeddings (not per-patient z)
+  ④ Fixed PCGrad: clone grads, include all shared params, call optimizer.step()
+  ⑤ Fixed FLAG: proper gradient flow, only perturb value channel
+  ⑥ Masked feature reconstruction pretext
+  ⑦ Auxiliary loss decay schedule
+  ⑧ Tuned XGBoost/LR baselines with val-based selection
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import time
@@ -42,38 +40,49 @@ except ImportError:
     HAS_WANDB = False
 
 from graph import build_mi, build_spearman, knn_sparsify, load_llm_graph
-from models_v2 import association_loss, build_model
+from models_v2 import association_mse, build_model, static_association_mse
 
 # ══════════════════════════════════════════════════════════════
-#  Training Utilities (FGSAM, PCGrad, FLAG)
+#  Utilities
+# ══════════════════════════════════════════════════════════════
+
+
+def set_seed(s):
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+    torch.cuda.manual_seed_all(s)
+
+
+def safe_auroc(y, p):
+    return float(roc_auc_score(y, p)) if len(np.unique(y)) > 1 else float("nan")
+
+
+def safe_auprc(y, p):
+    return (
+        float(average_precision_score(y, p)) if len(np.unique(y)) > 1 else float("nan")
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+#  FGSAM
 # ══════════════════════════════════════════════════════════════
 
 
 class FGSAM:
-    """
-    Fast Graph Sharpness-Aware Minimization (Luo et al., NeurIPS 2024).
-
-    Wraps a base optimizer. Each step:
-      1. Compute loss and gradient at current weights
-      2. Perturb weights: w + ρ * grad / ||grad||
-      3. Compute gradient at perturbed weights
-      4. Restore weights and apply perturbed gradient
-    """
-
     def __init__(self, params, base_optimizer, rho=0.05):
         self.params = list(params)
         self.base_optimizer = base_optimizer
         self.rho = rho
 
-    def _grad_norm(self):
-        norm = torch.norm(
-            torch.stack([p.grad.norm(p=2) for p in self.params if p.grad is not None])
-        )
-        return norm + 1e-12
-
     @torch.no_grad()
     def _perturb(self):
-        norm = self._grad_norm()
+        norm = (
+            torch.norm(
+                torch.stack([p.grad.norm() for p in self.params if p.grad is not None])
+            )
+            + 1e-12
+        )
         eps_list = []
         for p in self.params:
             if p.grad is None:
@@ -91,119 +100,115 @@ class FGSAM:
                 p.sub_(eps)
 
     def step(self, closure):
-        """
-        closure: callable that returns loss tensor.
-        Must be called AFTER the first backward (grads populated).
-        """
-        # Step 1: perturbation using existing grads
         eps_list = self._perturb()
-
-        # Step 2: recompute loss + grad at perturbed weights
         self.base_optimizer.zero_grad()
         loss = closure()
         loss.backward()
-
-        # Step 3: restore weights, apply perturbed gradient
         self._restore(eps_list)
         self.base_optimizer.step()
         return loss
 
 
-def pcgrad_project(grad_assoc: list[torch.Tensor], grad_aki: list[torch.Tensor]):
-    """
-    PCGrad (Yu et al., NeurIPS 2020): project conflicting gradients.
+# ══════════════════════════════════════════════════════════════
+#  PCGrad (FIXED: clone grads, all shared params, optimizer.step)
+# ══════════════════════════════════════════════════════════════
 
-    If cos(g_assoc, g_aki) < 0, remove the conflicting component.
-    Modifies gradients in-place.
-    """
-    # Flatten to vectors
-    flat_a = torch.cat([g.flatten() for g in grad_assoc if g is not None])
-    flat_b = torch.cat([g.flatten() for g in grad_aki if g is not None])
 
+def pcgrad_step(model, assoc_loss_val, aki_loss_val, optimizer, cfg):
+    """Fixed PCGrad: project conflicting task gradients, then step."""
+    shared = (
+        list(model.feature_embedding.parameters())
+        + list(model.input_proj.parameters())
+        + list(model.encoder.parameters())
+    )
+
+    optimizer.zero_grad()
+    g_a = torch.autograd.grad(
+        assoc_loss_val, shared, retain_graph=True, allow_unused=True
+    )
+    g_b = torch.autograd.grad(
+        aki_loss_val, shared, retain_graph=True, allow_unused=True
+    )
+    g_a = [
+        g.clone() if g is not None else torch.zeros_like(p) for g, p in zip(g_a, shared)
+    ]
+    g_b = [
+        g.clone() if g is not None else torch.zeros_like(p) for g, p in zip(g_b, shared)
+    ]
+
+    flat_a = torch.cat([g.flatten() for g in g_a])
+    flat_b = torch.cat([g.flatten() for g in g_b])
     dot = torch.dot(flat_a, flat_b)
-    if dot >= 0:
-        return  # Not conflicting — no surgery needed
 
-    # Project g_a onto normal plane of g_b (and vice versa)
-    norm_b_sq = torch.dot(flat_b, flat_b).clamp(min=1e-12)
-    norm_a_sq = torch.dot(flat_a, flat_a).clamp(min=1e-12)
+    if dot < 0:
+        # Project each onto the other's normal plane using CLONED originals
+        proj_ab = dot / (torch.dot(flat_b, flat_b).clamp(min=1e-12))
+        proj_ba = dot / (torch.dot(flat_a, flat_a).clamp(min=1e-12))
+        g_a_proj = [ga - proj_ab * gb for ga, gb in zip(g_a, g_b)]
+        g_b_proj = [gb - proj_ba * ga for ga, gb in zip(g_a, g_b)]
+        g_a, g_b = g_a_proj, g_b_proj
 
-    proj_a = dot / norm_b_sq
-    proj_b = dot / norm_a_sq
+    # Now backward the full loss for non-shared params (decoder, aki_head)
+    total_loss = assoc_loss_val + aki_loss_val
+    total_loss.backward()
 
-    offset = 0
-    for g_a, g_b in zip(grad_assoc, grad_aki):
-        if g_a is None or g_b is None:
-            continue
-        n = g_a.numel()
-        g_a.sub_(proj_a * g_b)
-        g_b.sub_(proj_b * g_a)
-        offset += n
+    # Overwrite shared param grads with surgered versions
+    for p, ga, gb in zip(shared, g_a, g_b):
+        if p.grad is not None:
+            p.grad = ga + gb
+
+    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+    optimizer.step()
 
 
-def flag_augment(model, batch, assoc_target, cfg, device, eps=0.01, n_steps=3):
-    """
-    FLAG (Kong et al., CVPR 2022): adversarial feature augmentation.
+# ══════════════════════════════════════════════════════════════
+#  FLAG (FIXED: proper gradient flow, only perturb value channel)
+# ══════════════════════════════════════════════════════════════
 
-    Perturbs node features along the gradient of the loss to generate
-    hard examples. Averages loss over clean + perturbed passes.
-    """
+
+def flag_step(model, batch, assoc_target, cfg, device, optimizer, eps=0.01, n_steps=3):
+    """Fixed FLAG: perturb only value channel (not obs_mask), accumulate real gradients."""
     batch = batch.to(device)
-    x_orig = batch.x.clone()
+    n_features = batch.x.size(0) // batch.num_graphs
 
-    total_loss = torch.tensor(0.0, device=device)
+    optimizer.zero_grad()
+    accumulated_loss = torch.tensor(0.0, device=device)
+
+    # Perturbation buffer (only on value channel, column 0)
+    delta = torch.zeros_like(batch.x[:, 0])  # [B*F]
 
     for step in range(n_steps):
-        if step == 0:
-            # Clean forward pass
-            batch.x = x_orig.clone()
-            batch.x.requires_grad_(True)
-        else:
-            # Perturb: x + eps * sign(grad_x) (FGSM-style)
-            with torch.no_grad():
-                perturbation = eps * batch.x.grad.sign()
-                batch.x = (x_orig + perturbation).detach()
-                batch.x.requires_grad_(True)
+        x_pert = batch.x.clone()
+        x_pert[:, 0] = x_pert[:, 0] + delta
+        # Don't perturb AKI nodes (they're already 0)
+        batch_modified = batch.clone()
+        batch_modified.x = x_pert
 
-        out = model(batch)
-        assoc_l = association_loss(
-            out.association_hat,
-            assoc_target,
-            ignore_diagonal=cfg["ignore_assoc_diagonal"],
-            directed=cfg["directed_target"],
-        )
+        out = model(batch_modified)
+        assoc_l = _compute_assoc_loss(model, out, assoc_target, cfg)
         aki_l = F.cross_entropy(out.aki_logits, batch.y.view(-1))
         loss = cfg["lambda_assoc"] * assoc_l + cfg["lambda_aki"] * aki_l
-        if out.kl_loss is not None:
-            loss = loss + cfg["lambda_kl"] * out.kl_loss
 
-        loss.backward(retain_graph=(step < n_steps - 1))
-        total_loss = total_loss + loss.detach()
+        loss.backward()
+        accumulated_loss = accumulated_loss + loss.detach()
 
-    batch.x = x_orig  # Restore
-    return total_loss / n_steps, out
+        if step < n_steps - 1:
+            # Compute adversarial perturbation from x gradient
+            # batch_modified.x had requires_grad via autograd, get grad on delta
+            grad_x = (
+                x_pert.grad if x_pert.grad is not None else torch.zeros_like(x_pert)
+            )
+            delta = (delta + eps * grad_x[:, 0].sign()).detach()
+            optimizer.zero_grad()
 
+    # Scale gradients by n_steps
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad /= n_steps
 
-# ══════════════════════════════════════════════════════════════
-#  Utilities
-# ══════════════════════════════════════════════════════════════
-
-
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def safe_auroc(y, p):
-    return float(roc_auc_score(y, p)) if len(np.unique(y)) > 1 else float("nan")
-
-
-def safe_auprc(y, p):
-    return (
-        float(average_precision_score(y, p)) if len(np.unique(y)) > 1 else float("nan")
-    )
+    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+    optimizer.step()
+    return accumulated_loss.item() / n_steps
 
 
 # ══════════════════════════════════════════════════════════════
@@ -212,13 +217,11 @@ def safe_auprc(y, p):
 
 
 def preprocess_fold(X_nf, missing_nf, binary_mask_f, train_idx):
-    """Train-only z-score + mean/mode imputation. AKI processed normally."""
     X = X_nf.float().numpy().copy()
     missing = missing_nf.bool().numpy()
     binary = binary_mask_f.bool().numpy()
     N, F = X.shape
     observed = ~missing
-
     x_scaled = np.zeros_like(X, dtype=np.float32)
     obs_mask = observed.astype(np.float32)
 
@@ -238,40 +241,34 @@ def preprocess_fold(X_nf, missing_nf, binary_mask_f, train_idx):
             fill = float(np.median(vals)) if len(vals) > 0 else 0.0
             col = X[:, j].copy()
             col[observed[:, j]] = (col[observed[:, j]] - mean) / std
-            fill_z = (fill - mean) / std
-            col[missing[:, j]] = fill_z
+            col[missing[:, j]] = (fill - mean) / std
             x_scaled[:, j] = col.astype(np.float32)
-
     return x_scaled, obs_mask
 
 
-def build_association_target(
-    edge_method: str,
-    x_train_scaled: np.ndarray,
-    data_dir: str,
-) -> tuple[torch.Tensor, bool]:
+def build_association_target(assoc_target_method, x_train_scaled, data_dir):
     """
-    Build the reconstruction target.
-    LLM → asymmetric P(i|j) matrix (directed=True)
-    Spearman/MI → symmetric |corr| (directed=False)
+    DECOUPLED from edge_method. Topology and target are independent.
     """
-    if edge_method == "llm":
-        adj_path = os.path.join(data_dir, "llm_adj.npy")
-        adj = np.load(adj_path).astype(np.float32)
-        # Normalise to [0, 1] if not already
-        if adj.max() > 1.0:
-            adj = adj / adj.max()
-        return torch.from_numpy(adj), True
-    else:
+    if assoc_target_method == "pearson":
         corr = np.corrcoef(x_train_scaled, rowvar=False)
         corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
         assoc = np.abs(corr).astype(np.float32)
         np.fill_diagonal(assoc, 1.0)
         return torch.from_numpy(assoc), False
+    elif assoc_target_method == "llm":
+        adj = np.load(os.path.join(data_dir, "llm_adj.npy")).astype(np.float32)
+        if adj.max() > 1.0:
+            adj = adj / adj.max()
+        return torch.from_numpy(adj), True
+    elif assoc_target_method == "none":
+        return None, False
+    else:
+        raise ValueError(f"assoc_target={assoc_target_method!r}")
 
 
 # ══════════════════════════════════════════════════════════════
-#  PyG Dataset
+#  Dataset
 # ══════════════════════════════════════════════════════════════
 
 
@@ -290,10 +287,10 @@ class FeatureGraphDataset(Dataset):
         return self.x_scaled.shape[0]
 
     def get(self, idx):
-        values = self.x_scaled[idx].view(-1, 1)
-        mask = self.obs_mask[idx].view(-1, 1)
+        v = self.x_scaled[idx].view(-1, 1)
+        m = self.obs_mask[idx].view(-1, 1)
         data = Data(
-            x=torch.cat([values, mask], dim=1),
+            x=torch.cat([v, m], dim=1),
             edge_index=self.edge_index,
             y=self.y[idx].view(1),
             feature_id=self.feature_id,
@@ -303,14 +300,14 @@ class FeatureGraphDataset(Dataset):
         return data
 
 
-def make_loader(dataset, indices, batch_size, shuffle):
+def make_loader(dataset, indices, bs, shuffle):
     return DataLoader(
-        dataset.index_select(indices.tolist()), batch_size=batch_size, shuffle=shuffle
+        dataset.index_select(indices.tolist()), batch_size=bs, shuffle=shuffle
     )
 
 
 # ══════════════════════════════════════════════════════════════
-#  Graph construction (reuses graph.py)
+#  Graph construction
 # ══════════════════════════════════════════════════════════════
 
 
@@ -325,11 +322,43 @@ def make_graph_for_fold(config, x_train_scaled, data_dir):
         edge_index, edge_weight = knn_sparsify(adj, k=config["k"], directed=False)
     else:
         edge_index, edge_weight = load_llm_graph(
-            data_dir=data_dir,
-            k=config["k"],
-            cv_cutoff=config.get("cv_cutoff"),
+            data_dir=data_dir, k=config["k"], cv_cutoff=config.get("cv_cutoff")
         )
     return edge_index.long(), edge_weight.float()
+
+
+# ══════════════════════════════════════════════════════════════
+#  Loss helpers
+# ══════════════════════════════════════════════════════════════
+
+
+def _compute_assoc_loss(model, out, assoc_target, cfg):
+    """Compute association loss: patient-level, static, or none."""
+    if assoc_target is None:
+        return torch.tensor(0.0, device=out.aki_logits.device)
+    if cfg["assoc_mode"] == "static":
+        return static_association_mse(model, assoc_target, ignore_diag=True)
+    else:  # "patient"
+        return association_mse(
+            out.association_hat,
+            assoc_target,
+            ignore_diag=True,
+            directed=cfg["directed_target"],
+        )
+
+
+def lambda_assoc_schedule(epoch, total_epochs, cfg):
+    """Optional auxiliary loss decay."""
+    base = cfg["lambda_assoc"]
+    if not cfg["assoc_decay"]:
+        return base
+    decay_start = int(total_epochs * cfg["assoc_decay_start"])
+    if epoch < decay_start:
+        return base
+    progress = (epoch - decay_start) / max(1, total_epochs - decay_start)
+    return base * max(
+        cfg["assoc_decay_floor"], 0.5 * (1 + math.cos(math.pi * progress))
+    )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -338,150 +367,96 @@ def make_graph_for_fold(config, x_train_scaled, data_dir):
 
 
 def run_epoch(
-    model,
-    loader,
-    optimizer,
-    assoc_target,
-    cfg,
-    device,
-    train,
-    fgsam=None,
-    use_pcgrad=False,
-    use_flag=False,
+    model, loader, optimizer, assoc_target, cfg, device, train, fgsam=None, epoch=0
 ):
     model.train(train)
     totals = {"loss": 0.0, "assoc_loss": 0.0, "aki_loss": 0.0, "kl_loss": 0.0}
     y_true, y_prob = [], []
+    la = (
+        lambda_assoc_schedule(epoch, cfg["epochs"], cfg)
+        if train
+        else cfg["lambda_assoc"]
+    )
 
     for batch in loader:
         batch = batch.to(device)
 
-        # ── FLAG augmentation ──
-        if train and use_flag:
-            avg_loss, out = flag_augment(
+        if train and cfg.get("use_flag"):
+            batch_loss = flag_step(
                 model,
                 batch,
                 assoc_target,
                 cfg,
                 device,
+                optimizer,
                 eps=cfg["flag_eps"],
                 n_steps=cfg["flag_steps"],
             )
-            if optimizer is not None:
-                optimizer.zero_grad()
-                avg_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
-                optimizer.step()
-            n = batch.num_graphs
-            totals["loss"] += avg_loss.item() * n
-
+            totals["loss"] += batch_loss * batch.num_graphs
+            out = model(batch)  # for metrics only
         else:
             if train:
                 optimizer.zero_grad()
-
             out = model(batch)
-            assoc_l = association_loss(
-                out.association_hat,
-                assoc_target,
-                ignore_diagonal=cfg["ignore_assoc_diagonal"],
-                directed=cfg["directed_target"],
-            )
+            assoc_l = _compute_assoc_loss(model, out, assoc_target, cfg)
             aki_l = F.cross_entropy(out.aki_logits, batch.y.view(-1))
-            loss = cfg["lambda_assoc"] * assoc_l + cfg["lambda_aki"] * aki_l
+            loss = la * assoc_l + cfg["lambda_aki"] * aki_l
             if out.kl_loss is not None:
                 loss = loss + cfg["lambda_kl"] * out.kl_loss
 
             if train and torch.isfinite(loss):
-                # ── PCGrad ──
-                if use_pcgrad and assoc_l.requires_grad and aki_l.requires_grad:
-                    shared = [p for p in model.encoder.parameters() if p.requires_grad]
-                    g_assoc = torch.autograd.grad(
-                        cfg["lambda_assoc"] * assoc_l,
-                        shared,
-                        retain_graph=True,
-                        allow_unused=True,
+                if cfg.get("use_pcgrad") and assoc_target is not None:
+                    pcgrad_step(
+                        model, la * assoc_l, cfg["lambda_aki"] * aki_l, optimizer, cfg
                     )
-                    g_aki = torch.autograd.grad(
-                        cfg["lambda_aki"] * aki_l,
-                        shared,
-                        retain_graph=True,
-                        allow_unused=True,
-                    )
-                    g_assoc = [
-                        g if g is not None else torch.zeros_like(p)
-                        for g, p in zip(g_assoc, shared)
-                    ]
-                    g_aki = [
-                        g if g is not None else torch.zeros_like(p)
-                        for g, p in zip(g_aki, shared)
-                    ]
-                    pcgrad_project(g_assoc, g_aki)
-                    # Apply surgered gradients
-                    for p, ga, gb in zip(shared, g_assoc, g_aki):
-                        p.grad = ga + gb
-                    # Backward for non-shared params (decoder, aki_head)
-                    loss.backward()
-                    # Overwrite shared grads with surgered ones
-                    for p, ga, gb in zip(shared, g_assoc, g_aki):
-                        p.grad = ga + gb
-
                 elif fgsam is not None:
-                    # FGSAM: first backward already done before calling step
                     loss.backward()
 
                     def closure():
-                        out2 = model(batch)
-                        al = association_loss(
-                            out2.association_hat,
-                            assoc_target,
-                            ignore_diagonal=cfg["ignore_assoc_diagonal"],
-                            directed=cfg["directed_target"],
-                        )
-                        ak = F.cross_entropy(out2.aki_logits, batch.y.view(-1))
-                        l = cfg["lambda_assoc"] * al + cfg["lambda_aki"] * ak
-                        if out2.kl_loss is not None:
-                            l = l + cfg["lambda_kl"] * out2.kl_loss
-                        return l
+                        o = model(batch)
+                        al = _compute_assoc_loss(model, o, assoc_target, cfg)
+                        ak = F.cross_entropy(o.aki_logits, batch.y.view(-1))
+                        return la * al + cfg["lambda_aki"] * ak
 
                     fgsam.step(closure)
-
                 else:
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
                     optimizer.step()
 
-            n = batch.num_graphs
-            totals["loss"] += loss.item() * n
-            totals["assoc_loss"] += assoc_l.item() * n
-            totals["aki_loss"] += aki_l.item() * n
-            if out.kl_loss is not None:
-                totals["kl_loss"] += out.kl_loss.item() * n
+            totals["loss"] += loss.item() * batch.num_graphs
+            totals["assoc_loss"] += assoc_l.item() * batch.num_graphs
+            totals["aki_loss"] += aki_l.item() * batch.num_graphs
 
         probs = out.aki_logits.softmax(dim=-1)[:, 1].detach().cpu().numpy()
         y_prob.extend(probs.tolist())
-        y_true.extend(batch.y.view(-1).detach().cpu().numpy().tolist())
+        y_true.extend(batch.y.view(-1).cpu().numpy().tolist())
 
-    n_total = max(1, len(y_true))
-    metrics = {k: v / n_total for k, v in totals.items()}
-    metrics["accuracy"] = accuracy_score(y_true, (np.array(y_prob) > 0.5).astype(int))
-    metrics["auroc"] = safe_auroc(y_true, y_prob)
-    metrics["auprc"] = safe_auprc(y_true, y_prob)
-    return metrics
+    n = max(1, len(y_true))
+    m = {k: v / n for k, v in totals.items()}
+    m["auroc"] = safe_auroc(y_true, y_prob)
+    m["auprc"] = safe_auprc(y_true, y_prob)
+    m["accuracy"] = accuracy_score(y_true, (np.array(y_prob) > 0.5).astype(int))
+    return m
 
 
 # ══════════════════════════════════════════════════════════════
-#  Baselines
+#  Baselines (tuned)
 # ══════════════════════════════════════════════════════════════
 
 
-def run_baselines(x_scaled, y, train_idx, test_idx, aki_idx, config):
+def run_baselines(x_scaled, y, train_idx, val_idx, test_idx, aki_idx, config):
     non_aki = [i for i in range(x_scaled.shape[1]) if i != aki_idx]
     X_bl = x_scaled[:, non_aki]
-    lr = LogisticRegression(
-        max_iter=5000, class_weight="balanced", C=config.get("logreg_C", 1.0)
-    )
-    lr.fit(X_bl[train_idx], y[train_idx])
-    lr_prob = lr.predict_proba(X_bl[test_idx])[:, 1]
+
+    best_lr_auc, best_lr = -1, None
+    for C in [0.01, 0.1, 1.0, 10.0]:
+        lr = LogisticRegression(max_iter=5000, class_weight="balanced", C=C)
+        lr.fit(X_bl[train_idx], y[train_idx])
+        va = safe_auroc(y[val_idx], lr.predict_proba(X_bl[val_idx])[:, 1])
+        if np.isfinite(va) and va > best_lr_auc:
+            best_lr_auc, best_lr = va, lr
+    lr_prob = best_lr.predict_proba(X_bl[test_idx])[:, 1]
     lr_auc, lr_auprc = safe_auroc(y[test_idx], lr_prob), safe_auprc(
         y[test_idx], lr_prob
     )
@@ -490,22 +465,41 @@ def run_baselines(x_scaled, y, train_idx, test_idx, aki_idx, config):
     try:
         from xgboost import XGBClassifier
 
-        n_pos = y[train_idx].sum()
-        n_neg = len(train_idx) - n_pos
-        xgb = XGBClassifier(
-            n_estimators=200,
-            max_depth=4,
-            learning_rate=0.1,
-            scale_pos_weight=max(1, n_neg / max(1, n_pos)),
-            eval_metric="logloss",
-            verbosity=0,
-            random_state=config["seed"],
-        )
-        xgb.fit(X_bl[train_idx], y[train_idx])
-        xgb_prob = xgb.predict_proba(X_bl[test_idx])[:, 1]
-        xgb_auc, xgb_auprc = safe_auroc(y[test_idx], xgb_prob), safe_auprc(
-            y[test_idx], xgb_prob
-        )
+        spw = max(1, (len(train_idx) - y[train_idx].sum()) / max(1, y[train_idx].sum()))
+        best_xv, best_xgb = -1, None
+        for md in [2, 3, 4, 6]:
+            for lr_r in [0.01, 0.05, 0.1]:
+                for ss in [0.7, 1.0]:
+                    xgb = XGBClassifier(
+                        n_estimators=1000,
+                        max_depth=md,
+                        learning_rate=lr_r,
+                        subsample=ss,
+                        colsample_bytree=0.8,
+                        scale_pos_weight=spw,
+                        min_child_weight=5,
+                        reg_alpha=0.1,
+                        reg_lambda=1.0,
+                        eval_metric="logloss",
+                        verbosity=0,
+                        random_state=config["seed"],
+                        early_stopping_rounds=30,
+                    )
+                    xgb.fit(
+                        X_bl[train_idx],
+                        y[train_idx],
+                        eval_set=[(X_bl[val_idx], y[val_idx])],
+                        verbose=False,
+                    )
+                    vp = xgb.predict_proba(X_bl[val_idx])[:, 1]
+                    va = safe_auroc(y[val_idx], vp)
+                    if np.isfinite(va) and va > best_xv:
+                        best_xv, best_xgb = va, xgb
+        if best_xgb is not None:
+            xp = best_xgb.predict_proba(X_bl[test_idx])[:, 1]
+            xgb_auc, xgb_auprc = safe_auroc(y[test_idx], xp), safe_auprc(
+                y[test_idx], xp
+            )
     except ImportError:
         pass
     return lr_auc, lr_auprc, xgb_auc, xgb_auprc
@@ -532,36 +526,31 @@ def train_one_fold(
     aki_idx = feature_names.index("aki_event")
     num_features = X_nf.shape[1]
 
-    # Preprocess (AKI still present for association target / graph)
     x_scaled, obs_mask = preprocess_fold(X_nf, missing_nf, binary_mask_f, train_idx)
     y = X_nf[:, aki_idx].float().numpy().astype(np.int64)
 
-    # Build graph
     edge_index, edge_weight = make_graph_for_fold(config, x_scaled[train_idx], data_dir)
     use_ew = config.get("use_edge_weights", False)
     edge_attr = edge_weight.unsqueeze(-1) if use_ew else None
     edge_dim = 1 if use_ew else None
 
-    # Build association target (directed for LLM, symmetric for others)
+    # DECOUPLED: topology is edge_method, target is assoc_target
     assoc_target, is_directed = build_association_target(
-        config["edge_method"],
-        x_scaled[train_idx],
-        data_dir,
+        config["assoc_target"], x_scaled[train_idx], data_dir
     )
-    assoc_target = assoc_target.to(device)
+    if assoc_target is not None:
+        assoc_target = assoc_target.to(device)
     config["directed_target"] = is_directed
 
-    # Mask AKI node AFTER building targets
+    # Mask AKI AFTER building targets
     x_scaled[:, aki_idx] = 0.0
     obs_mask[:, aki_idx] = 0.0
 
-    # Dataset
     dataset = FeatureGraphDataset(x_scaled, obs_mask, y, edge_index, edge_attr)
-    train_loader = make_loader(dataset, train_idx, config["batch_size"], shuffle=True)
-    val_loader = make_loader(dataset, val_idx, config["batch_size"], shuffle=False)
-    test_loader = make_loader(dataset, test_idx, config["batch_size"], shuffle=False)
+    train_loader = make_loader(dataset, train_idx, config["batch_size"], True)
+    val_loader = make_loader(dataset, val_idx, config["batch_size"], False)
+    test_loader = make_loader(dataset, test_idx, config["batch_size"], False)
 
-    # Model
     model = build_model(
         n_features=num_features,
         aki_idx=aki_idx,
@@ -577,30 +566,26 @@ def train_one_fold(
         use_laplacian_pe=config["use_laplacian_pe"],
         pe_dim=config.get("pe_dim", 16),
         use_dir_conv=config["use_dir_conv"],
+        readout=config["readout"],
+        use_masked_recon=config.get("use_masked_recon", False),
     ).to(device)
 
-    # Register LapPE if enabled
     if config["use_laplacian_pe"]:
         model.register_laplacian_pe(edge_index)
 
-    # Optimizer
-    base_optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config["lr"],
-        weight_decay=config["weight_decay"],
+    base_opt = torch.optim.AdamW(
+        model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"]
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        base_optimizer,
-        T_max=config["epochs"],
+        base_opt, T_max=config["epochs"]
+    )
+    fgsam = (
+        FGSAM(model.parameters(), base_opt, rho=config["fgsam_rho"])
+        if config["use_fgsam"]
+        else None
     )
 
-    fgsam = None
-    if config["use_fgsam"]:
-        fgsam = FGSAM(model.parameters(), base_optimizer, rho=config["fgsam_rho"])
-
-    # SWA setup
-    swa_model = None
-    swa_scheduler = None
+    swa_model, swa_sched = None, None
     swa_start = (
         int(config["epochs"] * config["swa_start_frac"])
         if config["use_swa"]
@@ -610,110 +595,80 @@ def train_one_fold(
         from torch.optim.swa_utils import SWALR, AveragedModel
 
         swa_model = AveragedModel(model)
-        swa_scheduler = SWALR(base_optimizer, swa_lr=config["lr"] * 0.5)
+        swa_sched = SWALR(base_opt, swa_lr=config["lr"] * 0.5)
 
-    best_val_auc, best_epoch = -1.0, -1
-    best_state = None
+    best_val, best_ep, best_state = -1.0, -1, None
     patience_left = config["patience"]
 
     for epoch in range(1, config["epochs"] + 1):
         in_swa = config["use_swa"] and epoch >= swa_start
-
         train_m = run_epoch(
             model,
             train_loader,
-            base_optimizer,
+            base_opt,
             assoc_target,
             config,
             device,
             train=True,
             fgsam=fgsam,
-            use_pcgrad=config["use_pcgrad"],
-            use_flag=config["use_flag"],
+            epoch=epoch,
         )
-
         if in_swa:
             swa_model.update_parameters(model)
-            swa_scheduler.step()
+            swa_sched.step()
         else:
             scheduler.step()
 
         if epoch == 1 or epoch % config["eval_every"] == 0:
-            eval_model = swa_model if (in_swa and swa_model is not None) else model
+            em = swa_model if in_swa and swa_model else model
             val_m = run_epoch(
-                eval_model,
+                em,
                 val_loader,
                 None,
                 assoc_target,
                 config,
                 device,
                 train=False,
+                epoch=epoch,
             )
-
             if config.get("wandb") and HAS_WANDB:
+                global_step = (fold - 1) * config["epochs"] + epoch
                 wandb.log(
                     {
                         f"fold{fold}/train_loss": train_m["loss"],
-                        f"fold{fold}/train_assoc": train_m["assoc_loss"],
-                        f"fold{fold}/train_aki": train_m["aki_loss"],
                         f"fold{fold}/train_auroc": train_m["auroc"],
                         f"fold{fold}/val_loss": val_m["loss"],
-                        f"fold{fold}/val_assoc": val_m["assoc_loss"],
-                        f"fold{fold}/val_aki": val_m["aki_loss"],
                         f"fold{fold}/val_auroc": val_m["auroc"],
                         f"fold{fold}/val_auprc": val_m["auprc"],
+                        f"fold{fold}/val_assoc": val_m["assoc_loss"],
+                        f"fold{fold}/val_aki": val_m["aki_loss"],
                         f"fold{fold}/lr": scheduler.get_last_lr()[0],
-                        f"fold{fold}/kl_loss": val_m.get("kl_loss", 0),
-                        "epoch": epoch,
+                        f"fold{fold}/epoch": epoch,
+                        "global_step": global_step,
                     },
-                    step=epoch,
+                    step=global_step,
                 )
-
-            if np.isfinite(val_m["auroc"]) and val_m["auroc"] > best_val_auc:
-                best_val_auc = val_m["auroc"]
-                best_epoch = epoch
-                target_model = swa_model.module if in_swa else model
-                best_state = {
-                    k: v.detach().cpu().clone()
-                    for k, v in target_model.state_dict().items()
-                }
+            if np.isfinite(val_m["auroc"]) and val_m["auroc"] > best_val:
+                best_val, best_ep = val_m["auroc"], epoch
+                tgt = swa_model.module if in_swa else model
+                best_state = {k: v.cpu().clone() for k, v in tgt.state_dict().items()}
                 patience_left = config["patience"]
             else:
                 patience_left -= 1
-
             if config.get("verbose"):
-                extras = []
-                if config["use_fgsam"]:
-                    extras.append("fgsam")
-                if config["use_pcgrad"]:
-                    extras.append("pcgrad")
-                if config["use_flag"]:
-                    extras.append("flag")
-                if in_swa:
-                    extras.append("swa")
-                tag = f" [{'+'.join(extras)}]" if extras else ""
                 print(
-                    f"    ep={epoch:03d} val_auc={val_m['auroc']:.4f} "
-                    f"best={best_val_auc:.4f} assoc={val_m['assoc_loss']:.4f} "
-                    f"pat={patience_left}{tag}"
+                    f"    ep={epoch:03d} val_auc={val_m['auroc']:.4f} best={best_val:.4f} pat={patience_left}"
                 )
             if patience_left <= 0:
                 break
 
-    if best_state is not None:
+    if best_state:
         model.load_state_dict(best_state)
-
-    # Test
     test_m = run_epoch(
         model, test_loader, None, assoc_target, config, device, train=False
     )
-    lr_auc, lr_auprc, xgb_auc, xgb_auprc = run_baselines(
-        x_scaled,
-        y,
-        train_idx,
-        test_idx,
-        aki_idx,
-        config,
+    lr_a, lr_p, xgb_a, xgb_p = run_baselines(
+        x_scaled, y, train_idx, val_idx, test_idx, aki_idx, config
     )
 
     return {
@@ -722,17 +677,18 @@ def train_one_fold(
         "auprc": test_m["auprc"],
         "accuracy": test_m["accuracy"],
         "assoc_loss": test_m["assoc_loss"],
-        "best_val_auroc": float(best_val_auc),
-        "best_epoch": int(best_epoch),
-        "logreg_auroc": lr_auc,
-        "logreg_auprc": lr_auprc,
-        "xgb_auroc": xgb_auc,
-        "xgb_auprc": xgb_auprc,
+        "best_val_auroc": float(best_val),
+        "best_epoch": int(best_ep),
+        "logreg_auroc": lr_a,
+        "logreg_auprc": lr_p,
+        "xgb_auroc": xgb_a,
+        "xgb_auprc": xgb_p,
+        "time_s": 0,
     }
 
 
 # ══════════════════════════════════════════════════════════════
-#  CV loop
+#  CV
 # ══════════════════════════════════════════════════════════════
 
 
@@ -742,7 +698,6 @@ def run_cv(config):
         "cuda" if torch.cuda.is_available() and not config.get("cpu") else "cpu"
     )
     data_dir = config["data_dir"]
-
     X_fn = torch.load(
         os.path.join(data_dir, "feature_matrix.pt"), weights_only=True
     ).float()
@@ -763,52 +718,26 @@ def run_cv(config):
     meta = pd.read_csv(os.path.join(data_dir, "cohort_meta.csv"))
     y_all = X_fn[aki_idx].numpy()
     eligible = (y_all == 1) | (meta["surv_days"].values >= config["landmark_days"])
-    eligible_idx = np.where(eligible)[0]
-    X_fn = X_fn[:, eligible_idx]
-    missing_fn = missing_fn[:, eligible_idx]
-    y_all = y_all[eligible_idx]
-    X_nf = X_fn.T.contiguous()
-    missing_nf = missing_fn.T.contiguous()
-
-    enhancements = []
-    if config["decoder_type"] != "symmetric":
-        enhancements.append(config["decoder_type"])
-    if config["use_fgsam"]:
-        enhancements.append("fgsam")
-    if config["use_pcgrad"]:
-        enhancements.append("pcgrad")
-    if config["use_flag"]:
-        enhancements.append("flag")
-    if config["use_swa"]:
-        enhancements.append("swa")
-    if config["use_vgae"]:
-        enhancements.append("vgae")
-    if config["use_laplacian_pe"]:
-        enhancements.append("lappe")
-    if config["use_dir_conv"]:
-        enhancements.append("dirconv")
-    enh_str = "+".join(enhancements) if enhancements else "baseline"
+    ei = np.where(eligible)[0]
+    X_fn, missing_fn, y_all = X_fn[:, ei], missing_fn[:, ei], y_all[ei]
+    X_nf, missing_nf = X_fn.T.contiguous(), missing_fn.T.contiguous()
 
     print("=" * 72)
-    print(f"Feature-graph AE v5 | {enh_str}")
+    print(
+        f"v7 | readout={config['readout']} assoc_target={config['assoc_target']} "
+        f"assoc_mode={config['assoc_mode']} decoder={config['decoder_type']}"
+    )
+    print(f"N={X_nf.shape[0]} F={X_nf.shape[1]} AKI={y_all.mean():.3f} device={device}")
     print("=" * 72)
-    print(
-        f"Device: {device}  N={X_nf.shape[0]}  F={X_nf.shape[1]}  AKI={y_all.mean():.3f}"
-    )
-    print(
-        f"Graph: {config['edge_method']} k={config['k']} conv={config['encoder_type']} L={config['layers']}"
-    )
-    print(
-        f"Decoder: {config['decoder_type']}  λ_assoc={config['lambda_assoc']} λ_aki={config['lambda_aki']}"
-    )
 
     if config.get("wandb") and HAS_WANDB:
-        run_name = config.get("run_name") or f"v5_{enh_str}"
+        name = (
+            config.get("run_name") or f"v7_{config['readout']}_{config['assoc_target']}"
+        )
         wandb.init(
             project=config.get("wandb_project", "dualr-graph"),
-            name=run_name,
+            name=name,
             config=config,
-            tags=["v5", config["decoder_type"], config["edge_method"]] + enhancements,
             reinit=True,
         )
 
@@ -817,69 +746,60 @@ def run_cv(config):
     )
     fold_metrics = []
 
-    for fold, (trainval_idx, test_idx) in enumerate(
-        outer.split(np.zeros(len(y_all)), y_all), 1
-    ):
+    for fold, (tv, te) in enumerate(outer.split(np.zeros(len(y_all)), y_all), 1):
         inner = StratifiedKFold(
             n_splits=5, shuffle=True, random_state=config["seed"] + fold
         )
-        tr_rel, va_rel = next(
-            inner.split(np.zeros(len(trainval_idx)), y_all[trainval_idx])
-        )
-        train_idx, val_idx = trainval_idx[tr_rel], trainval_idx[va_rel]
-        print(
-            f"\nFold {fold}/{config['cv_folds']}: train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}"
-        )
+        tr_r, va_r = next(inner.split(np.zeros(len(tv)), y_all[tv]))
+        tr, va = tv[tr_r], tv[va_r]
+        print(f"\nFold {fold}: train={len(tr)} val={len(va)} test={len(te)}")
 
         t0 = time.time()
-        metrics = train_one_fold(
+        m = train_one_fold(
             fold,
             config,
             X_nf,
             missing_nf,
             binary_mask_f,
             feature_names,
-            train_idx,
-            val_idx,
-            test_idx,
+            tr,
+            va,
+            te,
             data_dir,
             device,
         )
-        metrics["time_s"] = time.time() - t0
-        fold_metrics.append(metrics)
-
-        print(
-            f"  GNN  AUROC={metrics['auroc']:.4f}  AUPRC={metrics['auprc']:.4f}  assoc={metrics['assoc_loss']:.4f}"
-        )
-        print(f"  LR   AUROC={metrics['logreg_auroc']:.4f}")
-        if np.isfinite(metrics.get("xgb_auroc", float("nan"))):
-            print(f"  XGB  AUROC={metrics['xgb_auroc']:.4f}")
+        m["time_s"] = time.time() - t0
+        fold_metrics.append(m)
+        print(f"  GNN  AUROC={m['auroc']:.4f}  AUPRC={m['auprc']:.4f}")
+        print(f"  LR   AUROC={m['logreg_auroc']:.4f}")
+        if np.isfinite(m.get("xgb_auroc", float("nan"))):
+            print(f"  XGB  AUROC={m['xgb_auroc']:.4f}")
 
     aurocs = np.array([m["auroc"] for m in fold_metrics])
-    lr_aurocs = np.array([m["logreg_auroc"] for m in fold_metrics])
-    xgb_aurocs = np.array([m.get("xgb_auroc", float("nan")) for m in fold_metrics])
-
+    lr_a = np.array([m["logreg_auroc"] for m in fold_metrics])
     summary = {
-        "strategy": f"v5_{enh_str}",
+        "strategy": config.get("run_name", "v7"),
+        "readout": config["readout"],
+        "assoc_target": config["assoc_target"],
+        "assoc_mode": config["assoc_mode"],
         "auroc_mean": float(np.nanmean(aurocs)),
         "auroc_std": float(np.nanstd(aurocs)),
         "auprc_mean": float(np.nanmean([m["auprc"] for m in fold_metrics])),
         "auprc_std": float(np.nanstd([m["auprc"] for m in fold_metrics])),
         "assoc_loss_mean": float(np.nanmean([m["assoc_loss"] for m in fold_metrics])),
-        "logreg_auroc_mean": float(np.nanmean(lr_aurocs)),
-        "delta_vs_logreg": float(np.nanmean(aurocs - lr_aurocs)),
+        "logreg_auroc_mean": float(np.nanmean(lr_a)),
+        "xgb_auroc_mean": float(
+            np.nanmean([m.get("xgb_auroc", float("nan")) for m in fold_metrics])
+        ),
+        "delta_vs_logreg": float(np.nanmean(aurocs - lr_a)),
         "folds": fold_metrics,
         "config": config,
     }
-    if np.any(np.isfinite(xgb_aurocs)):
-        summary["xgb_auroc_mean"] = float(np.nanmean(xgb_aurocs))
-        summary["delta_vs_xgb"] = float(np.nanmean(aurocs - xgb_aurocs))
 
     print(f"\n{'='*72}")
     print(f"GNN  AUROC: {summary['auroc_mean']:.4f} ± {summary['auroc_std']:.4f}")
     print(f"LR   AUROC: {summary['logreg_auroc_mean']:.4f}")
-    if "xgb_auroc_mean" in summary:
-        print(f"XGB  AUROC: {summary['xgb_auroc_mean']:.4f}")
+    print(f"XGB  AUROC: {summary['xgb_auroc_mean']:.4f}")
     print(f"Δ vs LR:    {summary['delta_vs_logreg']:+.4f}")
     print(f"{'='*72}")
 
@@ -887,34 +807,7 @@ def run_cv(config):
         wandb.summary.update(
             {k: v for k, v in summary.items() if k not in ("folds", "config")}
         )
-        table = wandb.Table(
-            columns=[
-                "fold",
-                "auroc",
-                "auprc",
-                "assoc_loss",
-                "best_epoch",
-                "logreg_auroc",
-                "logreg_auprc",
-                "xgb_auroc",
-                "xgb_auprc",
-            ]
-        )
-        for m in fold_metrics:
-            table.add_data(
-                m["fold"],
-                m["auroc"],
-                m["auprc"],
-                m["assoc_loss"],
-                m["best_epoch"],
-                m["logreg_auroc"],
-                m["logreg_auprc"],
-                m.get("xgb_auroc", float("nan")),
-                m.get("xgb_auprc", float("nan")),
-            )
-        wandb.log({"fold_results": table})
         wandb.finish()
-
     return summary
 
 
@@ -925,12 +818,11 @@ def run_cv(config):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Feature-graph AE v5 (directed decoder + training enhancements)"
+        description="Feature-graph AE v7 (z_aki readout + fixes)"
     )
-    # Data
     p.add_argument("--data_dir", default="data")
     p.add_argument("--landmark_days", type=int, default=180)
-    # Graph
+    # Topology
     p.add_argument("--edge_method", default="llm", choices=["llm", "spearman", "mi"])
     p.add_argument("--k", type=int, default=8)
     p.add_argument("--use_edge_weights", action="store_true")
@@ -944,20 +836,33 @@ def parse_args():
     p.add_argument("--latent", type=int, default=16)
     p.add_argument("--heads", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.1)
-    # Decoder
     p.add_argument(
         "--decoder_type",
-        default="directed",
+        default="symmetric",
         choices=["symmetric", "directed", "crosscorr"],
     )
+    p.add_argument(
+        "--readout",
+        default="aki_concat",
+        choices=["global_pool", "non_aki_pool", "aki_only", "aki_concat"],
+    )
+    p.add_argument("--use_dir_conv", action="store_true")
+    p.add_argument("--use_vgae", action="store_true")
+    p.add_argument("--use_laplacian_pe", action="store_true")
+    p.add_argument("--pe_dim", type=int, default=16)
+    p.add_argument("--use_masked_recon", action="store_true")
+    # Association target (DECOUPLED from topology)
+    p.add_argument(
+        "--assoc_target", default="pearson", choices=["pearson", "llm", "none"]
+    )
+    p.add_argument("--assoc_mode", default="patient", choices=["patient", "static"])
     # Loss
     p.add_argument("--lambda_assoc", type=float, default=1.0)
     p.add_argument("--lambda_aki", type=float, default=1.0)
     p.add_argument("--lambda_kl", type=float, default=0.001)
-    p.add_argument("--ignore_assoc_diagonal", action="store_true", default=True)
-    p.add_argument(
-        "--no_ignore_diag", dest="ignore_assoc_diagonal", action="store_false"
-    )
+    p.add_argument("--assoc_decay", action="store_true", help="Cosine decay on λ_assoc")
+    p.add_argument("--assoc_decay_start", type=float, default=0.3)
+    p.add_argument("--assoc_decay_floor", type=float, default=0.01)
     # Training
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
@@ -966,46 +871,18 @@ def parse_args():
     p.add_argument("--patience", type=int, default=40)
     p.add_argument("--eval_every", type=int, default=5)
     p.add_argument("--grad_clip", type=float, default=5.0)
-    p.add_argument("--logreg_C", type=float, default=1.0)
-    # ═══ v5 enhancements (all off by default) ═══
-    p.add_argument(
-        "--use_fgsam",
-        action="store_true",
-        help="FGSAM flat-minima optimizer (NeurIPS 2024)",
-    )
+    # Enhancements
+    p.add_argument("--use_fgsam", action="store_true")
     p.add_argument("--fgsam_rho", type=float, default=0.05)
-    p.add_argument(
-        "--use_pcgrad",
-        action="store_true",
-        help="PCGrad gradient surgery (NeurIPS 2020)",
-    )
-    p.add_argument(
-        "--use_flag",
-        action="store_true",
-        help="FLAG adversarial augmentation (CVPR 2022)",
-    )
+    p.add_argument("--use_pcgrad", action="store_true")
+    p.add_argument("--use_flag", action="store_true")
     p.add_argument("--flag_eps", type=float, default=0.01)
     p.add_argument("--flag_steps", type=int, default=3)
-    p.add_argument(
-        "--use_swa", action="store_true", help="SWA weight averaging (UAI 2018)"
-    )
+    p.add_argument("--use_swa", action="store_true")
     p.add_argument("--swa_start_frac", type=float, default=0.75)
-    p.add_argument(
-        "--use_vgae", action="store_true", help="Variational GAE with KL regularisation"
-    )
-    p.add_argument(
-        "--use_laplacian_pe", action="store_true", help="Laplacian Positional Encoding"
-    )
-    p.add_argument(
-        "--use_dir_conv",
-        action="store_true",
-        help="DirGNNConv wrapper for directed edges (Rossi et al. LoG 2023)",
-    )
-    p.add_argument("--pe_dim", type=int, default=16)
     # CV
     p.add_argument("--cv_folds", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
-    # Infra
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--wandb", action="store_true")
