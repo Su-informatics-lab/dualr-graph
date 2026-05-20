@@ -144,6 +144,8 @@ class FeatureGraphDataset(Dataset):
             y=self.y[idx].view(1),
             feature_id=self.feature_id,
         )
+        if self.edge_weight is not None:
+            data.edge_weight = self.edge_weight
         return data
 
 
@@ -190,11 +192,8 @@ def run_epoch(
     config: dict,
     device: torch.device,
     train: bool,
-    edge_weight: torch.Tensor,
     binary_mask_f: torch.Tensor,
     assoc_target: torch.Tensor | None,
-    x_true_all: torch.Tensor,
-    obs_mask_all: torch.Tensor,
 ):
     """One epoch of training or evaluation.
 
@@ -221,8 +220,8 @@ def run_epoch(
         if train:
             optimizer.zero_grad(set_to_none=True)
 
-        # Forward pass with directed edge weights.
-        out = model(batch, edge_weight=edge_weight)
+        # Forward pass — edge_weight is inside batch (PyG batched it).
+        out = model(batch)
 
         # Reconstruct x_true and obs_mask for this batch from batch.x.
         # batch.x is [B*F, 2], reshaped to [B, F, 2].
@@ -382,10 +381,12 @@ def train_one_fold(
     x_scaled[:, aki_idx] = 0.0
     obs_mask[:, aki_idx] = 0.0
 
-    # Edge weight stays on device, shared across all patients.
-    edge_weight_device = edge_weight.to(device) if config["use_edge_weights"] else None
+    # Edge weight for directed conv — stored in each Data, PyG batches it.
+    ew_for_dataset = edge_weight if config["use_edge_weights"] else None
 
-    dataset = FeatureGraphDataset(x_scaled, obs_mask, y, edge_index)
+    dataset = FeatureGraphDataset(
+        x_scaled, obs_mask, y, edge_index, edge_weight=ew_for_dataset
+    )
     train_loader = make_loader(dataset, train_idx, config["batch_size"], shuffle=True)
     val_loader = make_loader(dataset, val_idx, config["batch_size"], shuffle=False)
     test_loader = make_loader(dataset, test_idx, config["batch_size"], shuffle=False)
@@ -422,11 +423,8 @@ def train_one_fold(
             config,
             device,
             train=True,
-            edge_weight=edge_weight_device,
             binary_mask_f=binary_mask_device,
             assoc_target=assoc_target,
-            x_true_all=None,
-            obs_mask_all=None,
         )
         scheduler.step()
 
@@ -438,11 +436,8 @@ def train_one_fold(
                 config,
                 device,
                 train=False,
-                edge_weight=edge_weight_device,
                 binary_mask_f=binary_mask_device,
                 assoc_target=assoc_target,
-                x_true_all=None,
-                obs_mask_all=None,
             )
 
             if config.get("wandb") and HAS_WANDB:
@@ -491,11 +486,8 @@ def train_one_fold(
         config,
         device,
         train=False,
-        edge_weight=edge_weight_device,
         binary_mask_f=binary_mask_device,
         assoc_target=assoc_target,
-        x_true_all=None,
-        obs_mask_all=None,
     )
 
     lr_auc, lr_auprc, xgb_auc, xgb_auprc = run_baselines(

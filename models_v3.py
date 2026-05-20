@@ -259,14 +259,15 @@ class FeatureGraphAutoencoderV3(nn.Module):
         x_hat_flat = self.value_decoder(z)  # [B*F]
         return x_hat_flat.view(batch_size, self.n_features)  # [B, F]
 
-    def forward(self, batch, edge_weight: torch.Tensor | None = None) -> ModelOutput:
+    def forward(self, batch) -> ModelOutput:
         """
         Full forward: encode → decode → reconstruct.
 
-        batch: PyG Batch with batch.x, batch.edge_index, batch.feature_id
-        edge_weight: [E] LLM P(v_i|v_j) weights. Passed separately since
-                     they're graph-level (shared), not per-sample.
+        batch: PyG Batch with batch.x, batch.edge_index, batch.feature_id,
+               and optionally batch.edge_weight (LLM P(v_i|v_j)).
         """
+        edge_weight = getattr(batch, "edge_weight", None)
+
         z = self.encode(
             batch.x,
             batch.edge_index,

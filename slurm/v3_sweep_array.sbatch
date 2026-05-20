@@ -7,8 +7,8 @@
 #SBATCH --mem=32G
 #SBATCH --time=01:30:00
 #SBATCH --job-name=v10_%a
-#SBATCH --output=slurm/v10_%a_%j.out
-#SBATCH --error=slurm/v10_%a_%j.err
+#SBATCH --output=logs/v10_%a_%j.out
+#SBATCH --error=logs/v10_%a_%j.err
 #SBATCH --array=0-35
 
 # ── v3 sweep (array version) ──
@@ -21,7 +21,7 @@
 
 cd /N/project/depot/hw56/dualreasoning/dualr-graph
 source .venv_cpu/bin/activate
-mkdir -p results
+mkdir -p results logs
 
 # Sweep grid: 3 × 2 × 3 × 2 = 36
 LAMBDA_REC_LIST=(0.5 1.0 2.0)
