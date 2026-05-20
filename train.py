@@ -73,15 +73,17 @@ def preprocess_fold(
     missing_nf: torch.Tensor,
     binary_mask_f: torch.Tensor,
     train_idx: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Train-only z-score + mean/mode imputation.
+
+    NOTE: AKI column is processed normally here so the association target
+    can use its correlation values. The caller must zero out the AKI column
+    in x_scaled and obs_mask AFTER building the association target.
 
     Returns:
         x_scaled   [N, F]  float32 — standardised, imputed values
         obs_mask   [N, F]  float32 — 1 if observed, 0 if imputed
-        means      [F]
-        stds       [F]
     """
     X = X_nf.float().numpy().copy()
     missing = missing_nf.bool().numpy()
@@ -312,14 +314,21 @@ def train_one_fold(
     x_scaled, obs_mask = preprocess_fold(X_nf, missing_nf, binary_mask_f, train_idx)
     y = X_nf[:, aki_idx].float().numpy().astype(np.int64)
 
-    # Build graph from train set
+    # Build graph from train set (AKI values still present for correlation)
     edge_index, edge_weight = make_graph_for_fold(config, x_scaled[train_idx], data_dir)
     use_ew = config.get("use_edge_weights", False)
     edge_attr = edge_weight.unsqueeze(-1) if use_ew else None
     edge_dim = 1 if use_ew else None
 
-    # Build association target from train set
+    # Build association target from train set (AKI values still present)
     assoc_target = build_association_target(x_scaled[train_idx]).to(device)
+
+    # NOW mask AKI node: value=0, observed=0 for ALL patients.
+    # The node still participates in message passing (edges + identity embedding)
+    # and its association row is in the target, but the model cannot read the
+    # label directly from the node input.
+    x_scaled[:, aki_idx] = 0.0
+    obs_mask[:, aki_idx] = 0.0
 
     # Create PyG dataset
     dataset = FeatureGraphDataset(x_scaled, obs_mask, y, edge_index, edge_attr)
@@ -372,8 +381,13 @@ def train_one_fold(
                         f"fold{fold}/train_loss": train_m["loss"],
                         f"fold{fold}/train_assoc": train_m["assoc_loss"],
                         f"fold{fold}/train_aki": train_m["aki_loss"],
-                        f"fold{fold}/val_auroc": val_m["auroc"],
+                        f"fold{fold}/train_auroc": train_m["auroc"],
+                        f"fold{fold}/val_loss": val_m["loss"],
                         f"fold{fold}/val_assoc": val_m["assoc_loss"],
+                        f"fold{fold}/val_aki": val_m["aki_loss"],
+                        f"fold{fold}/val_auroc": val_m["auroc"],
+                        f"fold{fold}/val_auprc": val_m["auprc"],
+                        f"fold{fold}/lr": scheduler.get_last_lr()[0],
                         "epoch": epoch,
                     },
                     step=epoch,
@@ -555,6 +569,8 @@ def run_cv(config):
         "auroc_mean": float(np.nanmean(aurocs)),
         "auroc_std": float(np.nanstd(aurocs)),
         "auprc_mean": float(np.nanmean([m["auprc"] for m in fold_metrics])),
+        "auprc_std": float(np.nanstd([m["auprc"] for m in fold_metrics])),
+        "assoc_loss_mean": float(np.nanmean([m["assoc_loss"] for m in fold_metrics])),
         "logreg_auroc_mean": float(np.nanmean(lr_aurocs)),
         "delta_vs_logreg": float(np.nanmean(aurocs - lr_aurocs)),
         "folds": fold_metrics,
@@ -579,15 +595,29 @@ def run_cv(config):
             {k: v for k, v in summary.items() if k not in ("folds", "config")}
         )
         table = wandb.Table(
-            columns=["fold", "auroc", "auprc", "logreg_auroc", "xgb_auroc"]
+            columns=[
+                "fold",
+                "auroc",
+                "auprc",
+                "assoc_loss",
+                "best_epoch",
+                "logreg_auroc",
+                "logreg_auprc",
+                "xgb_auroc",
+                "xgb_auprc",
+            ]
         )
         for m in fold_metrics:
             table.add_data(
                 m["fold"],
                 m["auroc"],
                 m["auprc"],
+                m["assoc_loss"],
+                m["best_epoch"],
                 m["logreg_auroc"],
+                m["logreg_auprc"],
                 m.get("xgb_auroc", float("nan")),
+                m.get("xgb_auprc", float("nan")),
             )
         wandb.log({"fold_results": table})
         wandb.finish()
