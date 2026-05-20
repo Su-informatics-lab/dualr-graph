@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=gae_v4.1
+#SBATCH --job-name=gae_v42
 #SBATCH --account=r01109
 #SBATCH --partition=general
 #SBATCH --nodes=1
@@ -9,17 +9,33 @@
 #SBATCH --time=04:00:00
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
-#SBATCH --array=0-30
+#SBATCH --array=0-27
 
 # ──────────────────────────────────────────────────────────────
-#  v4 sweep — association decoder architecture  (31 jobs)
+#  v4.2 sweep — regularisation-first, guided by v4.1 results
 #
-#  Core grid (0-23): 3 edges × 4 λ_assoc × 2 depths  [gatv2, pooled]
-#  Conv ablation (24-26): gcn / gat / graph_transformer  [llm, λ=1.0, L=2]
-#  AKI mode (27-28): dual × 2 λ_assoc  [llm, gatv2, L=2]
-#  Latent dim (29-30): 16 / 64  [llm, gatv2, L=2, λ=1.0]
+#  v4.1 findings:
+#    - lat16 > lat32 > lat64 → overfitting, push capacity lower
+#    - GCN ≈ GATv2 > GAT > transformer → simpler models generalise
+#    - LLM edges >> spearman/MI → fix LLM, drop data-derived
+#    - λ_assoc=1.0 sweet spot → keep, sweep λ_aki instead
+#    - val_loss u-shape early → lr too high, patience can tighten
+#    - pooled ≈ dual → fix pooled
 #
-#  Submit:  sbatch slurm/gae_v4_sweep.sbatch
+#  Block A (0-17):  Regularisation grid  [GCN, LLM]
+#    3 latent (8, 12, 16) × 3 dropout (0.15, 0.2, 0.3) × 2 lr (3e-4, 5e-4)
+#
+#  Block B (18-21): Hidden dim + weight decay  [GCN, LLM, lat=12]
+#    hidden (32, 48) × wd (5e-4, 1e-3)
+#
+#  Block C (22-24): Architecture at best reg  [LLM, lat=12, drop=0.2, lr=3e-4]
+#    GATv2, GCN+ew, graph_transformer
+#
+#  Block D (25-27): λ_aki reweight  [GCN, LLM, lat=12, drop=0.2, lr=3e-4]
+#    λ_aki = 0.5, 2.0, 3.0  (with λ_assoc=1.0 fixed)
+#
+#  Total: 28 jobs
+#  Submit:  sbatch slurm/gae_v42_sweep.sbatch
 # ──────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -28,75 +44,99 @@ cd /N/project/depot/hw56/dualreasoning/dualr-graph
 source .venv_cpu/bin/activate
 mkdir -p logs results
 
-EDGE_METHODS=("spearman" "mi" "llm")
-LAMBDA_ASSOCS=(0.1 0.5 1.0 2.0)
-N_LAYERS=(2 3)
-CONV_ALTS=("gcn" "gat" "graph_transformer")
-LATENT_ALTS=(16 64)
+# ── Shared defaults ──
+EDGE="llm"
+LAYERS=2
+HEADS=4
+LA_ASSOC=1.0
+LA_AKI=1.0
+AKI_MODE="pooled"
+PATIENCE=30
+EPOCHS=500
+BATCH=128
+GRAD_CLIP=5.0
 
 IDX=$SLURM_ARRAY_TASK_ID
 
-if [ $IDX -lt 24 ]; then
-    # ── Core grid: 3 edges × 4 λ × 2 depths ──
-    n_lam=${#LAMBDA_ASSOCS[@]}
-    n_dep=${#N_LAYERS[@]}
-    e_idx=$(( IDX / (n_lam * n_dep) ))
-    remainder=$(( IDX % (n_lam * n_dep) ))
-    l_idx=$(( remainder / n_dep ))
-    d_idx=$(( remainder % n_dep ))
+LATENTS=(8 12 16)
+DROPOUTS=(0.15 0.2 0.3)
+LRS=(3e-4 5e-4)
 
-    EDGE=${EDGE_METHODS[$e_idx]}
-    LAM=${LAMBDA_ASSOCS[$l_idx]}
-    DEPTH=${N_LAYERS[$d_idx]}
-    CONV="gatv2"
-    AKI_MODE="pooled"
-    LATENT=32
-    NAME="v4_${EDGE}_l${DEPTH}_la${LAM}"
+if [ $IDX -lt 18 ]; then
+    # ── Block A: Regularisation grid  (3 × 3 × 2 = 18) ──
+    n_drop=${#DROPOUTS[@]}
+    n_lr=${#LRS[@]}
+    lat_idx=$(( IDX / (n_drop * n_lr) ))
+    remainder=$(( IDX % (n_drop * n_lr) ))
+    drop_idx=$(( remainder / n_lr ))
+    lr_idx=$(( remainder % n_lr ))
+
+    LATENT=${LATENTS[$lat_idx]}
+    DROPOUT=${DROPOUTS[$drop_idx]}
+    LR=${LRS[$lr_idx]}
+    HIDDEN=64
+    CONV="gcn"
+    WD=1e-4
+    NAME="v4.2_gcn_lat${LATENT}_d${DROPOUT}_lr${LR}"
     EXTRA=""
-    if [ "$EDGE" = "llm" ]; then EXTRA="--use_edge_weights"; fi
 
-elif [ $IDX -lt 27 ]; then
-    # ── Conv ablation: gcn / gat / graph_transformer ──
-    c_idx=$(( IDX - 24 ))
-    EDGE="llm"
-    LAM=1.0
-    DEPTH=2
-    CONV=${CONV_ALTS[$c_idx]}
-    AKI_MODE="pooled"
-    LATENT=32
-    NAME="v4.1_llm_${CONV}_l2_la1.0"
-    EXTRA="--use_edge_weights"
+elif [ $IDX -lt 22 ]; then
+    # ── Block B: Hidden dim + weight decay (2 × 2 = 4) ──
+    b_idx=$(( IDX - 18 ))
+    HIDDENS=(32 48)
+    WDS=(5e-4 1e-3)
+    h_idx=$(( b_idx / 2 ))
+    w_idx=$(( b_idx % 2 ))
 
-elif [ $IDX -lt 29 ]; then
-    # ── AKI mode ablation: dual ──
-    d_idx=$(( IDX - 27 ))
-    LAMS=(0.5 1.0)
-    EDGE="llm"
-    LAM=${LAMS[$d_idx]}
-    DEPTH=2
-    CONV="gatv2"
-    AKI_MODE="dual"
-    LATENT=32
-    NAME="v4_llm_dual_l2_la${LAM}"
-    EXTRA="--use_edge_weights"
+    LATENT=12
+    DROPOUT=0.2
+    LR=3e-4
+    HIDDEN=${HIDDENS[$h_idx]}
+    WD=${WDS[$w_idx]}
+    CONV="gcn"
+    NAME="v4.2_gcn_h${HIDDEN}_wd${WD}"
+    EXTRA=""
+
+elif [ $IDX -lt 25 ]; then
+    # ── Block C: Architecture comparison (3) ──
+    c_idx=$(( IDX - 22 ))
+    CONVS=("gatv2" "gcn" "graph_transformer")
+
+    LATENT=12
+    DROPOUT=0.2
+    LR=3e-4
+    HIDDEN=64
+    WD=1e-4
+    CONV=${CONVS[$c_idx]}
+    NAME="v4.2_${CONV}_lat12_bestReg"
+    # GCN with edge weights is worth testing separately
+    if [ "$CONV" = "gcn" ]; then
+        EXTRA="--use_edge_weights"
+        NAME="v4.2_gcn_ew_lat12_bestReg"
+    else
+        EXTRA=""
+    fi
 
 else
-    # ── Latent dim ablation ──
-    lat_idx=$(( IDX - 29 ))
-    EDGE="llm"
-    LAM=1.0
-    DEPTH=2
-    CONV="gatv2"
-    AKI_MODE="pooled"
-    LATENT=${LATENT_ALTS[$lat_idx]}
-    NAME="v4.1_llm_lat${LATENT}_l2_la1.0"
-    EXTRA="--use_edge_weights"
+    # ── Block D: λ_aki reweight (3) ──
+    d_idx=$(( IDX - 25 ))
+    LAKIS=(0.5 2.0 3.0)
+    LA_AKI=${LAKIS[$d_idx]}
+
+    LATENT=12
+    DROPOUT=0.2
+    LR=3e-4
+    HIDDEN=64
+    WD=1e-4
+    CONV="gcn"
+    NAME="v4.2_gcn_laAki${LA_AKI}"
+    EXTRA=""
 fi
 
 echo "═══════════════════════════════════════════════"
 echo "  Job ${IDX}: ${NAME}"
-echo "  edge=${EDGE} conv=${CONV} λ_assoc=${LAM} L=${DEPTH}"
-echo "  aki_mode=${AKI_MODE} latent=${LATENT} ${EXTRA}"
+echo "  conv=${CONV} lat=${LATENT} h=${HIDDEN} drop=${DROPOUT}"
+echo "  lr=${LR} wd=${WD} λ_assoc=${LA_ASSOC} λ_aki=${LA_AKI}"
 echo "  $(date)"
 echo "═══════════════════════════════════════════════"
 
@@ -104,18 +144,21 @@ python train.py \
     --edge_method "$EDGE" \
     --encoder_type "$CONV" \
     --k 8 \
-    --lambda_assoc "$LAM" \
-    --lambda_aki 1.0 \
-    --layers "$DEPTH" \
-    --hidden 64 \
+    --lambda_assoc "$LA_ASSOC" \
+    --lambda_aki "$LA_AKI" \
+    --layers "$LAYERS" \
+    --hidden "$HIDDEN" \
     --latent "$LATENT" \
-    --heads 4 \
-    --dropout 0.1 \
+    --heads "$HEADS" \
+    --dropout "$DROPOUT" \
     --aki_mode "$AKI_MODE" \
-    --batch_size 128 \
-    --epochs 500 \
-    --patience 40 \
+    --lr "$LR" \
+    --weight_decay "$WD" \
+    --batch_size "$BATCH" \
+    --epochs "$EPOCHS" \
+    --patience "$PATIENCE" \
     --eval_every 5 \
+    --grad_clip "$GRAD_CLIP" \
     --verbose \
     --wandb \
     --run_name "$NAME" \
