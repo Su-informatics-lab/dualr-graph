@@ -314,7 +314,7 @@ def reconstruction_loss(
     Binary features: BCE.  Continuous features: SmoothL1.
     AKI is excluded — it has its own loss.
     """
-    B, F = x_hat.shape
+    B, n_f = x_hat.shape
     binary = binary_mask.bool().to(x_hat.device)
 
     # Build mask: observed AND not AKI.
