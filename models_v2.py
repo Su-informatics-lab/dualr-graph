@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-models_v2.py — Feature-graph autoencoder with directed association decoder.
+models_v2.py — Feature-graph autoencoder for ICI→AKI prediction.
 
-Key upgrades over models.py (v4):
-  ① Directed decoder: separate src/tgt projections so P(i|j) ≠ P(j|i)
-  ② Optional VGAE: μ/σ heads + KL regularisation on latent
-  ③ Laplacian Positional Encoding for structural awareness
-  ④ Cross-correlation decoder option (S2GAE-inspired)
+Key design (informed by ChatGPT audit + empirical sweeps v4-v6):
+  ① AKI node as query/target token — classify from z_aki, not mean(all)
+  ② Decoupled topology (LLM edges) from association target (Pearson)
+  ③ Static association loss on feature embeddings (not per-patient z)
+  ④ WeightedDirGCNConv preserving LLM edge weights
+  ⑤ Optional masked feature reconstruction (GraphMAE-style pretext)
+  ⑥ Directed / symmetric / cross-correlation decoders
+  ⑦ Optional VGAE, Laplacian PE
 
-References:
-  - Gravity-Inspired GAE (Salha et al., ECML-PKDD 2019)
-  - S2GAE (Tan et al., WSDM 2023)
-  - VGAE (Kipf & Welling, NeurIPS 2016 Workshop)
-  - GraphGPS LapPE (Rampášek et al., NeurIPS 2022)
+Readout modes (--readout):
+  global_pool   : mean(all nodes)           — v4/v5 baseline
+  non_aki_pool  : mean(non-AKI nodes)       — excludes masked node
+  aki_only      : z_aki                     — outcome-node query
+  aki_concat    : concat(z_aki, mean(non-AKI)) — recommended default
 """
 
 from __future__ import annotations
@@ -23,56 +26,58 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import (
-    DirGNNConv,
-    GATv2Conv,
-    GCNConv,
-    TransformerConv,
-    global_mean_pool,
-)
-
-# ── Dataclass ────────────────────────────────────────────────
+from torch_geometric.nn import GATv2Conv, GCNConv, TransformerConv
 
 
 @dataclass
 class ModelOutput:
-    z: torch.Tensor  # [B, F, emb]
+    z: torch.Tensor  # [B*F, emb]
     association_hat: torch.Tensor  # [B, F, F]
     aki_logits: torch.Tensor  # [B, n_classes]
-    kl_loss: torch.Tensor | None  # scalar, only if VGAE
+    kl_loss: torch.Tensor | None
+    recon_loss: torch.Tensor | None  # masked feature reconstruction
 
 
-# ── Laplacian Positional Encoding ────────────────────────────
+# ── Laplacian PE ─────────────────────────────────────────────
 
 
-def compute_laplacian_pe(
-    edge_index: torch.Tensor, n_nodes: int, pe_dim: int
-) -> torch.Tensor:
-    """
-    Precompute Laplacian eigenvector PE for a small graph.
-    For 38 nodes, we can use all non-trivial eigenvectors.
-    Returns: [n_nodes, pe_dim] float tensor.
-    """
-    # Build adjacency from edge_index (undirected for Laplacian)
+def compute_laplacian_pe(edge_index, n_nodes, pe_dim):
     adj = torch.zeros(n_nodes, n_nodes)
-    src, tgt = edge_index[0], edge_index[1]
-    adj[src, tgt] = 1.0
-    adj = (adj + adj.T).clamp(max=1.0)  # symmetrise for Laplacian
-    deg = adj.sum(dim=1)
-    D = torch.diag(deg)
-    L = D - adj
-    # Normalised Laplacian
-    deg_inv_sqrt = torch.where(deg > 0, deg.pow(-0.5), torch.zeros_like(deg))
-    D_inv_sqrt = torch.diag(deg_inv_sqrt)
-    L_norm = torch.eye(n_nodes) - D_inv_sqrt @ adj @ D_inv_sqrt
-
-    eigvals, eigvecs = torch.linalg.eigh(L_norm)
-    # Skip first eigenvector (constant), take next pe_dim
-    pe = eigvecs[:, 1 : pe_dim + 1]  # [n_nodes, pe_dim]
-    # Sign ambiguity: random sign flip during training handled externally
+    adj[edge_index[0], edge_index[1]] = 1.0
+    adj = (adj + adj.T).clamp(max=1.0)
+    deg = adj.sum(1)
+    deg_inv = torch.where(deg > 0, deg.pow(-0.5), torch.zeros_like(deg))
+    L_norm = torch.eye(n_nodes) - torch.diag(deg_inv) @ adj @ torch.diag(deg_inv)
+    _, eigvecs = torch.linalg.eigh(L_norm)
+    pe = eigvecs[:, 1 : pe_dim + 1]
     if pe.shape[1] < pe_dim:
         pe = F.pad(pe, (0, pe_dim - pe.shape[1]))
     return pe.float()
+
+
+# ── WeightedDirGCNConv ───────────────────────────────────────
+
+
+class WeightedDirGCNConv(nn.Module):
+    """
+    Direction-aware GCN that preserves edge weights.
+    Runs separate convolutions on incoming and outgoing edges,
+    combines with a learnable alpha.
+    """
+
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.conv_in = GCNConv(in_dim, out_dim, add_self_loops=False, normalize=True)
+        self.conv_out = GCNConv(in_dim, out_dim, add_self_loops=False, normalize=True)
+        self.root = nn.Linear(in_dim, out_dim)
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+
+    def forward(self, x, edge_index, edge_weight=None):
+        a = torch.sigmoid(self.alpha)
+        x_in = self.conv_in(x, edge_index, edge_weight=edge_weight)
+        rev_ei = edge_index.flip(0)
+        x_out = self.conv_out(x, rev_ei, edge_weight=edge_weight)
+        return a * x_in + (1 - a) * x_out + self.root(x)
 
 
 # ── Encoder blocks ───────────────────────────────────────────
@@ -94,12 +99,15 @@ class GraphBlock(nn.Module):
         self.conv_type = conv_type.lower()
         self.use_dir_conv = use_dir_conv
 
-        # Build base conv
-        if self.conv_type == "gcn":
-            base_conv = GCNConv(in_dim, out_dim, normalize=True)
+        if use_dir_conv:
+            # WeightedDirGCNConv — always GCN-based, preserves edge weights
+            self.conv = WeightedDirGCNConv(in_dim, out_dim)
+            actual_out = out_dim
+        elif self.conv_type == "gcn":
+            self.conv = GCNConv(in_dim, out_dim, normalize=True)
             actual_out = out_dim
         elif self.conv_type == "gatv2":
-            base_conv = GATv2Conv(
+            self.conv = GATv2Conv(
                 in_dim,
                 out_dim,
                 heads=heads,
@@ -110,7 +118,7 @@ class GraphBlock(nn.Module):
             )
             actual_out = out_dim * heads if concat else out_dim
         elif self.conv_type == "graph_transformer":
-            base_conv = TransformerConv(
+            self.conv = TransformerConv(
                 in_dim,
                 out_dim,
                 heads=heads,
@@ -123,21 +131,14 @@ class GraphBlock(nn.Module):
         else:
             raise ValueError(f"Unknown conv_type={self.conv_type!r}")
 
-        # Wrap with DirGNNConv for direction-aware message passing
-        if use_dir_conv:
-            self.conv = DirGNNConv(base_conv)
-        else:
-            self.conv = base_conv
-
         self.norm = nn.LayerNorm(actual_out)
         self.dropout = float(dropout)
         self.actual_out = actual_out
 
     def forward(self, x, edge_index, edge_attr=None):
         if self.use_dir_conv:
-            # DirGNNConv handles direction splitting internally;
-            # pass edge_attr only for non-GCN (GCN uses edge_weight kwarg)
-            x = self.conv(x, edge_index)
+            ew = edge_attr.squeeze(-1) if edge_attr is not None else None
+            x = self.conv(x, edge_index, edge_weight=ew)
         elif self.conv_type == "gcn":
             ew = edge_attr.squeeze(-1) if edge_attr is not None else None
             x = self.conv(x, edge_index, edge_weight=ew)
@@ -150,76 +151,61 @@ class GraphBlock(nn.Module):
 
 
 class SymmetricDecoder(nn.Module):
-    """Original inner-product: sigmoid(Z @ Z.T / sqrt(d))."""
-
-    def forward(self, z_by_graph: torch.Tensor) -> torch.Tensor:
+    def forward(self, z_by_graph):
         d = z_by_graph.size(-1)
-        scores = torch.matmul(z_by_graph, z_by_graph.transpose(1, 2))
-        return torch.sigmoid(scores / math.sqrt(d))
+        return torch.sigmoid(z_by_graph @ z_by_graph.transpose(1, 2) / math.sqrt(d))
 
 
 class DirectedDecoder(nn.Module):
-    """
-    Asymmetric decoder: sigmoid(Z_tgt @ Z_src.T / sqrt(d)).
-
-    Each node produces two representations:
-      z_src: "I am a source (conditioning variable)"
-      z_tgt: "I am a target (being predicted)"
-
-    A_hat[i,j] = sigmoid(z_tgt_i · z_src_j / sqrt(d)) ≈ P(i|j)
-
-    This respects the LLM prior's directionality.
-    """
-
-    def __init__(self, embedding_dim: int):
+    def __init__(self, embedding_dim):
         super().__init__()
         self.proj_src = nn.Linear(embedding_dim, embedding_dim, bias=False)
         self.proj_tgt = nn.Linear(embedding_dim, embedding_dim, bias=False)
 
-    def forward(self, z_by_graph: torch.Tensor) -> torch.Tensor:
-        z_src = self.proj_src(z_by_graph)  # [B, F, d]
-        z_tgt = self.proj_tgt(z_by_graph)  # [B, F, d]
-        d = z_by_graph.size(-1)
-        scores = torch.matmul(z_tgt, z_src.transpose(1, 2))  # [B, F, F]
-        return torch.sigmoid(scores / math.sqrt(d))
+    def forward(self, z_by_graph):
+        z_src = self.proj_src(z_by_graph)
+        z_tgt = self.proj_tgt(z_by_graph)
+        return torch.sigmoid(
+            z_tgt @ z_src.transpose(1, 2) / math.sqrt(z_by_graph.size(-1))
+        )
 
 
 class CrossCorrelationDecoder(nn.Module):
-    """
-    S2GAE-inspired: element-wise correlation of paired embeddings,
-    reduced to a scalar per pair via a learned projection.
-    """
-
-    def __init__(self, embedding_dim: int):
+    def __init__(self, embedding_dim):
         super().__init__()
         self.proj = nn.Linear(embedding_dim, 1, bias=False)
 
-    def forward(self, z_by_graph: torch.Tensor) -> torch.Tensor:
+    def forward(self, z_by_graph):
         B, F, d = z_by_graph.shape
-        # Pairwise element-wise product: z_i ⊙ z_j for all (i,j)
         z_i = z_by_graph.unsqueeze(2).expand(B, F, F, d)
         z_j = z_by_graph.unsqueeze(1).expand(B, F, F, d)
-        cross = z_i * z_j  # [B, F, F, d]
-        scores = self.proj(cross).squeeze(-1)  # [B, F, F]
-        return torch.sigmoid(scores)
+        return torch.sigmoid(self.proj(z_i * z_j).squeeze(-1))
 
 
-# ── Main model ───────────────────────────────────────────────
+# ── Masked Feature Reconstruction Head ───────────────────────
+
+
+class MaskedFeatureReconHead(nn.Module):
+    """Reconstruct masked node values from their embeddings."""
+
+    def __init__(self, embedding_dim, hidden_dim):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(embedding_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, z_masked_nodes):
+        return self.head(z_masked_nodes).squeeze(-1)
+
+
+# ── Main Model ───────────────────────────────────────────────
 
 
 class FeatureGraphAutoencoderV2(nn.Module):
-    """
-    Feature-graph autoencoder with directed decoder + optional VGAE.
 
-    Decoder modes:
-      symmetric  : z @ z.T  (baseline, for Spearman/MI targets)
-      directed   : z_tgt @ z_src.T  (for LLM directed targets)
-      crosscorr  : proj(z_i ⊙ z_j)  (S2GAE-inspired)
-
-    VGAE mode:
-      Adds μ/σ projection heads after encoder → reparameterised z.
-      KL divergence returned as auxiliary loss.
-    """
+    READOUT_MODES = ("global_pool", "non_aki_pool", "aki_only", "aki_concat")
 
     def __init__(
         self,
@@ -234,32 +220,35 @@ class FeatureGraphAutoencoderV2(nn.Module):
         n_classes: int = 2,
         edge_dim: int | None = None,
         aki_idx: int | None = None,
-        # New v2 options
-        decoder_type: str = "directed",  # symmetric / directed / crosscorr
+        decoder_type: str = "symmetric",
         use_vgae: bool = False,
         use_laplacian_pe: bool = False,
         pe_dim: int = 16,
-        use_dir_conv: bool = False,  # DirGNNConv wrapper (Rossi et al. LoG 2023)
+        use_dir_conv: bool = False,
+        readout: str = "aki_concat",
+        use_masked_recon: bool = False,
     ):
         super().__init__()
+        assert readout in self.READOUT_MODES, f"readout={readout!r}"
         self.n_features = n_features
         self.aki_idx = aki_idx
+        self.readout = readout
         self.use_vgae = use_vgae
         self.use_laplacian_pe = use_laplacian_pe
+        self.use_masked_recon = use_masked_recon
         self.pe_dim = pe_dim
 
         # Feature identity embedding
         identity_dim = hidden_dim
         self.feature_embedding = nn.Embedding(n_features, identity_dim)
 
-        # Laplacian PE projection (if enabled)
+        # Laplacian PE
         pe_proj_dim = 0
         if use_laplacian_pe:
             pe_proj_dim = hidden_dim // 4
             self.pe_proj = nn.Linear(pe_dim, pe_proj_dim)
             self.register_buffer("_lap_pe", torch.zeros(n_features, pe_dim))
 
-        # Input: [value, obs_mask] + identity + optional PE
         self.input_proj = nn.Linear(
             node_input_dim + identity_dim + pe_proj_dim, hidden_dim
         )
@@ -287,12 +276,12 @@ class FeatureGraphAutoencoderV2(nn.Module):
             current = blocks[-1].actual_out
         self.encoder = nn.ModuleList(blocks)
 
-        # VGAE heads (optional)
+        # VGAE
         if use_vgae:
             self.mu_head = nn.Linear(embedding_dim, embedding_dim)
             self.logvar_head = nn.Linear(embedding_dim, embedding_dim)
 
-        # Decoder
+        # Decoder (operates on per-patient z or static embeddings)
         if decoder_type == "symmetric":
             self.decoder = SymmetricDecoder()
         elif decoder_type == "directed":
@@ -300,123 +289,163 @@ class FeatureGraphAutoencoderV2(nn.Module):
         elif decoder_type == "crosscorr":
             self.decoder = CrossCorrelationDecoder(embedding_dim)
         else:
-            raise ValueError(f"Unknown decoder_type={decoder_type!r}")
+            raise ValueError(f"decoder_type={decoder_type!r}")
 
-        # AKI head: pooled mode
+        # AKI head — input dim depends on readout mode
+        if readout in ("global_pool", "non_aki_pool", "aki_only"):
+            aki_in = embedding_dim
+        elif readout == "aki_concat":
+            aki_in = embedding_dim * 2
         self.aki_head = nn.Sequential(
-            nn.Linear(embedding_dim, hidden_dim),
+            nn.Linear(aki_in, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, n_classes),
         )
 
-    def register_laplacian_pe(self, edge_index: torch.Tensor):
-        """Precompute and cache LapPE from the graph topology."""
+        # Masked feature reconstruction
+        if use_masked_recon:
+            self.recon_head = MaskedFeatureReconHead(embedding_dim, hidden_dim)
+
+    def register_laplacian_pe(self, edge_index):
         pe = compute_laplacian_pe(edge_index, self.n_features, self.pe_dim)
         self._lap_pe = pe.to(self._lap_pe.device)
 
     def encode(self, x, edge_index, feature_id, edge_attr=None):
         parts = [x, self.feature_embedding(feature_id)]
         if self.use_laplacian_pe:
-            pe = self._lap_pe[feature_id]  # [B*F, pe_dim]
-            parts.append(self.pe_proj(pe))
+            parts.append(self.pe_proj(self._lap_pe[feature_id]))
         h = F.relu(self.input_proj(torch.cat(parts, dim=-1)))
         for block in self.encoder:
             h = block(h, edge_index, edge_attr)
         return h
 
-    def reparameterise(self, z_flat: torch.Tensor):
+    def reparameterise(self, z_flat):
         mu = self.mu_head(z_flat)
         logvar = self.logvar_head(z_flat)
-        if self.training:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            z = mu + eps * std
-        else:
-            z = mu
+        std = torch.exp(0.5 * logvar)
+        z = mu + torch.randn_like(std) * std if self.training else mu
         kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
         return z, kl
 
-    def forward(self, batch) -> ModelOutput:
+    def _readout(self, z_by_graph):
+        """Extract classification features from per-node embeddings."""
+        if self.readout == "global_pool":
+            return z_by_graph.mean(dim=1)
+        elif self.readout == "non_aki_pool":
+            mask = torch.ones(
+                self.n_features, dtype=torch.bool, device=z_by_graph.device
+            )
+            mask[self.aki_idx] = False
+            return z_by_graph[:, mask, :].mean(dim=1)
+        elif self.readout == "aki_only":
+            return z_by_graph[:, self.aki_idx, :]
+        elif self.readout == "aki_concat":
+            z_aki = z_by_graph[:, self.aki_idx, :]
+            mask = torch.ones(
+                self.n_features, dtype=torch.bool, device=z_by_graph.device
+            )
+            mask[self.aki_idx] = False
+            z_ctx = z_by_graph[:, mask, :].mean(dim=1)
+            return torch.cat([z_aki, z_ctx], dim=-1)
+
+    def static_association(self):
+        """Association from feature identity embeddings (patient-invariant)."""
+        E = self.feature_embedding.weight  # [F, identity_dim]
+        # Project to embedding_dim via the first encoder block's input path
+        # For simplicity, use the decoder on a pseudo-z from identity embeddings
+        # The decoder expects [1, F, emb_dim], so we need a projection
+        # Use a simple inner product on the raw embeddings
+        d = E.size(-1)
+        return torch.sigmoid(E @ E.T / math.sqrt(d)).unsqueeze(0)
+
+    def forward(self, batch, pretext_mask=None) -> ModelOutput:
         z_flat = self.encode(
-            batch.x,
-            batch.edge_index,
-            batch.feature_id,
-            batch.edge_attr,
+            batch.x, batch.edge_index, batch.feature_id, batch.edge_attr
         )
 
-        # Optional VGAE
         kl_loss = None
         if self.use_vgae:
             z_flat, kl_loss = self.reparameterise(z_flat)
 
         z_by_graph = z_flat.view(batch.num_graphs, self.n_features, -1)
 
-        # Association decoder
+        # Association decoder (per-patient or static — chosen externally via loss)
         association_hat = self.decoder(z_by_graph)
 
-        # AKI prediction
-        pooled = global_mean_pool(z_flat, batch.batch)
-        logits = self.aki_head(pooled)
+        # AKI prediction from readout
+        cls_features = self._readout(z_by_graph)
+        logits = self.aki_head(cls_features)
+
+        # Masked feature reconstruction
+        recon_loss = None
+        if self.use_masked_recon and pretext_mask is not None and self.training:
+            # pretext_mask: [B*F] bool — True for masked observed non-AKI nodes
+            if pretext_mask.any():
+                z_masked = z_flat[pretext_mask]
+                recon_loss = z_masked  # raw embeddings; loss computed externally
 
         return ModelOutput(
             z=z_flat,
             association_hat=association_hat,
             aki_logits=logits,
             kl_loss=kl_loss,
+            recon_loss=recon_loss,
         )
 
 
-# ── Loss functions ───────────────────────────────────────────
+# ── Loss helpers ─────────────────────────────────────────────
 
 
-def association_loss(
-    association_hat: torch.Tensor,
-    association_target: torch.Tensor,
-    ignore_diagonal: bool = True,
-    directed: bool = False,
-) -> torch.Tensor:
-    """
-    MSE between predicted and target association matrices.
-    For directed=True, uses the full asymmetric matrix.
-    For directed=False, symmetrises before comparison.
-    """
-    target = association_target.to(association_hat.device)
-    target = target.unsqueeze(0).expand_as(association_hat)
-    n = target.size(-1)
-
+def association_mse(a_hat, a_target, ignore_diag=True, directed=False):
+    target = a_target.to(a_hat.device).unsqueeze(0).expand_as(a_hat)
     if not directed:
-        # Symmetrise both (for Spearman/MI targets)
-        association_hat = (association_hat + association_hat.transpose(1, 2)) / 2
+        a_hat = (a_hat + a_hat.transpose(1, 2)) / 2
         target = (target + target.transpose(1, 2)) / 2
-
-    if ignore_diagonal:
+    n = target.size(-1)
+    if ignore_diag:
         mask = ~torch.eye(n, dtype=torch.bool, device=target.device)
-        return F.mse_loss(association_hat[:, mask], target[:, mask])
-    return F.mse_loss(association_hat, target)
+        return F.mse_loss(a_hat[:, mask], target[:, mask])
+    return F.mse_loss(a_hat, target)
+
+
+def static_association_mse(model, a_target, ignore_diag=True):
+    """Association loss on feature identity embeddings (patient-invariant)."""
+    a_hat = model.static_association()  # [1, F, F]
+    target = a_target.to(a_hat.device).unsqueeze(0)
+    n = target.size(-1)
+    # Always symmetric for static
+    a_hat = (a_hat + a_hat.transpose(1, 2)) / 2
+    target = (target + target.transpose(1, 2)) / 2
+    if ignore_diag:
+        mask = ~torch.eye(n, dtype=torch.bool, device=target.device)
+        return F.mse_loss(a_hat[:, mask], target[:, mask])
+    return F.mse_loss(a_hat, target)
 
 
 # ── Builder ──────────────────────────────────────────────────
 
 
 def build_model(
-    n_features: int,
-    aki_idx: int,
-    hidden_dim: int = 64,
-    embedding_dim: int = 16,
-    n_layers: int = 2,
-    encoder_type: str = "gcn",
-    n_heads: int = 4,
-    dropout: float = 0.1,
-    n_classes: int = 2,
-    edge_dim: int | None = None,
-    decoder_type: str = "directed",
-    use_vgae: bool = False,
-    use_laplacian_pe: bool = False,
-    pe_dim: int = 16,
-    use_dir_conv: bool = False,
+    n_features,
+    aki_idx,
+    hidden_dim=64,
+    embedding_dim=16,
+    n_layers=2,
+    encoder_type="gcn",
+    n_heads=4,
+    dropout=0.1,
+    n_classes=2,
+    edge_dim=None,
+    decoder_type="symmetric",
+    use_vgae=False,
+    use_laplacian_pe=False,
+    pe_dim=16,
+    use_dir_conv=False,
+    readout="aki_concat",
+    use_masked_recon=False,
     **_,
-) -> FeatureGraphAutoencoderV2:
+):
     return FeatureGraphAutoencoderV2(
         n_features=n_features,
         node_input_dim=2,
@@ -434,4 +463,6 @@ def build_model(
         use_laplacian_pe=use_laplacian_pe,
         pe_dim=pe_dim,
         use_dir_conv=use_dir_conv,
+        readout=readout,
+        use_masked_recon=use_masked_recon,
     )
