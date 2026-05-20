@@ -9,7 +9,7 @@
 #SBATCH --time=04:00:00
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
-#SBATCH --array=0-27
+#SBATCH --array=0-29
 
 # ──────────────────────────────────────────────────────────────
 #  v4.2 sweep — regularisation-first, guided by v4.1 results
@@ -34,7 +34,10 @@
 #  Block D (25-27): λ_aki reweight  [GCN, LLM, lat=12, drop=0.2, lr=3e-4]
 #    λ_aki = 0.5, 2.0, 3.0  (with λ_assoc=1.0 fixed)
 #
-#  Total: 28 jobs
+#  Block E (28-29): Edge method baselines  [GCN, best reg from A]
+#    spearman, mi — matched config so LLM vs data-derived is fair
+#
+#  Total: 30 jobs
 #  Submit:  sbatch slurm/gae_v42_sweep.sbatch
 # ──────────────────────────────────────────────────────────────
 
@@ -117,7 +120,7 @@ elif [ $IDX -lt 25 ]; then
         EXTRA=""
     fi
 
-else
+elif [ $IDX -lt 28 ]; then
     # ── Block D: λ_aki reweight (3) ──
     d_idx=$(( IDX - 25 ))
     LAKIS=(0.5 2.0 3.0)
@@ -130,6 +133,22 @@ else
     WD=1e-4
     CONV="gcn"
     NAME="v4.2_gcn_laAki${LA_AKI}"
+    EXTRA=""
+
+else
+    # ── Block E: Edge method baselines (2) ──
+    # Matched config to best LLM settings for fair comparison in paper
+    e_idx=$(( IDX - 28 ))
+    EDGES=("spearman" "mi")
+    EDGE=${EDGES[$e_idx]}
+
+    LATENT=12
+    DROPOUT=0.2
+    LR=3e-4
+    HIDDEN=64
+    WD=1e-4
+    CONV="gcn"
+    NAME="v4.2_${EDGE}_gcn_lat12_bestReg"
     EXTRA=""
 fi
 
