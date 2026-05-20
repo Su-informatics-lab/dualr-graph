@@ -6,9 +6,9 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=01:30:00
-#SBATCH --job-name=v3_%a
-#SBATCH --output=slurm/v3_%a_%j.out
-#SBATCH --error=slurm/v3_%a_%j.err
+#SBATCH --job-name=v10_%a
+#SBATCH --output=slurm/v10_%a_%j.out
+#SBATCH --error=slurm/v10_%a_%j.err
 #SBATCH --array=0-35
 
 # ── v3 sweep (array version) ──
@@ -48,7 +48,7 @@ LA=${LAMBDA_AKI_LIST[$i_aki]}
 LAS=${LAMBDA_ASSOC_LIST[$i_assoc]}
 DO=${DROPOUT_LIST[$i_do]}
 
-NAME="v3_rec${LR}_aki${LA}_assoc${LAS}_do${DO}"
+NAME="v10_rec${LR}_aki${LA}_assoc${LAS}_do${DO}"
 
 echo "===== Job ${IDX}: ${NAME} at $(date) ====="
 echo "lambda_rec=${LR} lambda_aki=${LA} lambda_assoc=${LAS} dropout=${DO}"
@@ -70,6 +70,7 @@ python train_v3.py \
     --cv_folds 5 \
     --seed 42 \
     --verbose \
+    --wandb \
     --lambda_rec ${LR} \
     --lambda_aki ${LA} \
     --lambda_assoc ${LAS} \

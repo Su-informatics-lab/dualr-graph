@@ -580,7 +580,7 @@ def run_cv(config):
     if config.get("wandb") and HAS_WANDB:
         run_name = (
             config.get("run_name")
-            or f"v3_{config['lambda_rec']}_{config['lambda_aki']}_{config['lambda_assoc']}"
+            or f"v10_{config['lambda_rec']}_{config['lambda_aki']}_{config['lambda_assoc']}"
         )
         wandb.init(
             project=config.get("wandb_project", "dualr-graph"),
@@ -636,7 +636,7 @@ def run_cv(config):
     xgb_aurocs = np.array([m.get("xgb_auroc", float("nan")) for m in fold_metrics])
 
     summary = {
-        "strategy": config.get("run_name") or "v3",
+        "strategy": config.get("run_name") or "v10",
         "auroc_mean": float(np.nanmean(aurocs)),
         "auroc_std": float(np.nanstd(aurocs)),
         "auprc_mean": float(np.nanmean([m["auprc"] for m in fold_metrics])),
@@ -693,7 +693,7 @@ def generate_sweep_configs(base_config: dict) -> list[dict]:
         c = base_config.copy()
         for k, v in zip(keys, vals):
             c[k] = v
-        name = f"v3_rec{c['lambda_rec']}_aki{c['lambda_aki']}_assoc{c['lambda_assoc']}_do{c['dropout']}"
+        name = f"v10_rec{c['lambda_rec']}_aki{c['lambda_aki']}_assoc{c['lambda_assoc']}_do{c['dropout']}"
         c["run_name"] = name
         configs.append(c)
 
@@ -788,7 +788,7 @@ def main():
     else:
         summary = run_cv(config)
         os.makedirs("results", exist_ok=True)
-        name = args.run_name or "v3"
+        name = args.run_name or "v10"
         with open(os.path.join("results", f"{name}.json"), "w") as f:
             json.dump(summary, f, indent=2)
         print(f"Saved: results/{name}.json")
