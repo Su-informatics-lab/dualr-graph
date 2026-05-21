@@ -259,26 +259,38 @@ class FeatureGraphAutoencoderV3(nn.Module):
         x_hat_flat = self.value_decoder(z)  # [B*F]
         return x_hat_flat.view(batch_size, self.n_features)  # [B, F]
 
-    def forward(self, batch) -> ModelOutput:
+    def forward(self, batch, n_iter: int = 1) -> ModelOutput:
         """
-        Full forward: encode → decode → reconstruct.
+        Forward with optional iterative refinement.
 
-        batch: PyG Batch with batch.x, batch.edge_index, batch.feature_id,
-               and optionally batch.edge_weight (LLM P(v_i|v_j)).
+        n_iter=1: standard single pass (AKI masked).
+        n_iter=2+: pass 1 predicts X̂_aki, pass 2+ fills AKI with
+                   previous prediction and re-encodes for refined output.
         """
         edge_weight = getattr(batch, "edge_weight", None)
+        x_current = batch.x  # [B*F, 2]
 
-        z = self.encode(
-            batch.x,
-            batch.edge_index,
-            batch.feature_id,
-            edge_weight=edge_weight,
-        )
+        for iteration in range(n_iter):
+            z = self.encode(
+                x_current,
+                batch.edge_index,
+                batch.feature_id,
+                edge_weight=edge_weight,
+            )
+            x_hat = self.decode(z, batch.num_graphs)  # [B, F]
 
-        # Feature value reconstruction.
-        x_hat = self.decode(z, batch.num_graphs)  # [B, F]
+            # If more iterations remain, fill AKI with current prediction.
+            if iteration < n_iter - 1:
+                x_filled = x_current.clone()
+                # Find AKI node positions in the flat [B*F, 2] tensor.
+                aki_positions = (batch.feature_id == self.aki_idx).nonzero(
+                    as_tuple=True
+                )[0]
+                aki_preds = torch.sigmoid(x_hat[:, self.aki_idx]).detach()
+                x_filled[aki_positions, 0] = aki_preds  # fill value
+                x_filled[aki_positions, 1] = 1.0  # mark as "observed"
+                x_current = x_filled
 
-        # AKI probability from reconstruction.
         aki_prob = torch.sigmoid(x_hat[:, self.aki_idx])  # [B]
 
         # Optional association matrix (auxiliary).
@@ -296,88 +308,39 @@ class FeatureGraphAutoencoderV3(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────
-# Loss functions
+# Loss functions (Su's design: simple and unified)
 # ─────────────────────────────────────────────────────────────
 
 
-def reconstruction_loss(
+def reconstruction_mse(
     x_hat: torch.Tensor,  # [B, F] raw decoder output
-    x_true: torch.Tensor,  # [B, F] true feature values
-    obs_mask: torch.Tensor,  # [B, F] 1=observed, 0=missing/masked
-    binary_mask: torch.Tensor,  # [F] 1=binary feature, 0=continuous
-    aki_idx: int,
+    x_true: torch.Tensor,  # [B, F] true feature values (AKI filled with label)
+    obs_mask: torch.Tensor,  # [B, F] 1=observed, 0=missing
 ) -> torch.Tensor:
     """
-    Per-feature reconstruction loss, excluding AKI.
+    Simple MSE over ALL 38 features, including AKI. No binary/continuous split.
 
-    Only computes loss on OBSERVED features (obs_mask=1).
-    Binary features: BCE.  Continuous features: SmoothL1.
-    AKI is excluded — it has its own loss.
+    Only observed features contribute (obs_mask=1). AKI's obs_mask should be
+    set to 1 with its true label as target before calling this.
     """
-    B, n_f = x_hat.shape
-    binary = binary_mask.bool().to(x_hat.device)
-
-    # Build mask: observed AND not AKI.
-    feat_mask = obs_mask.clone()  # [B, F]
-    feat_mask[:, aki_idx] = 0.0  # exclude AKI
-
-    losses = []
-    weights = []
-
-    # Binary features (excluding AKI).
-    bin_cols = binary.clone()
-    bin_cols[aki_idx] = False
-    bin_eligible = feat_mask[:, bin_cols]  # [B, n_bin]
-    if bin_eligible.sum() > 0:
-        pred_bin = x_hat[:, bin_cols]
-        true_bin = x_true[:, bin_cols].clamp(0, 1)
-        # Masked mean: only observed entries.
-        bce = F.binary_cross_entropy_with_logits(pred_bin, true_bin, reduction="none")
-        bin_loss = (bce * bin_eligible).sum() / bin_eligible.sum().clamp(min=1)
-        losses.append(bin_loss)
-        weights.append(bin_eligible.sum().item())
-
-    # Continuous features.
-    cont_cols = ~binary
-    cont_eligible = feat_mask[:, cont_cols]
-    if cont_eligible.sum() > 0:
-        pred_cont = x_hat[:, cont_cols]
-        true_cont = x_true[:, cont_cols]
-        sl1 = F.smooth_l1_loss(pred_cont, true_cont, reduction="none")
-        cont_loss = (sl1 * cont_eligible).sum() / cont_eligible.sum().clamp(min=1)
-        losses.append(cont_loss)
-        weights.append(cont_eligible.sum().item())
-
-    if not losses:
-        return torch.tensor(0.0, device=x_hat.device, requires_grad=True)
-
-    # Weighted average of binary and continuous losses.
-    w = torch.tensor(weights, device=x_hat.device)
-    l = torch.stack(losses)
-    return (l * w).sum() / w.sum().clamp(min=1)
+    diff_sq = (x_hat - x_true).pow(2)
+    masked = diff_sq * obs_mask
+    return masked.sum() / obs_mask.sum().clamp(min=1)
 
 
-def aki_loss(
-    aki_prob: torch.Tensor,  # [B] sigmoid output
+def aki_ce_loss(
+    x_hat_aki: torch.Tensor,  # [B] raw logit (pre-sigmoid)
     aki_true: torch.Tensor,  # [B] 0 or 1
 ) -> torch.Tensor:
-    """
-    AKI prediction loss: BCE + MSE (Su's sketch shows both).
-
-    BCE gives good gradient for classification.
-    MSE pushes probability closer to 0/1, acts as calibration.
-    """
-    aki_true_f = aki_true.float()
-    # BCE on probabilities (numerically stable version via logits would be
-    # better, but aki_prob is already sigmoided from x_hat).
-    bce = F.binary_cross_entropy(aki_prob, aki_true_f, reduction="mean")
-    mse = F.mse_loss(aki_prob, aki_true_f, reduction="mean")
-    return bce + mse
+    """CE on AKI as additional emphasis. Uses logits for numerical stability."""
+    return F.binary_cross_entropy_with_logits(
+        x_hat_aki, aki_true.float(), reduction="mean"
+    )
 
 
 def association_aux_loss(
-    association_hat: torch.Tensor,  # [B, F, F]
-    association_target: torch.Tensor,  # [F, F] train-set |Pearson corr|
+    association_hat: torch.Tensor,
+    association_target: torch.Tensor,
     ignore_diag: bool = True,
 ) -> torch.Tensor:
     """Optional auxiliary: regularize z@z.T to match train-set correlations."""
@@ -385,19 +348,18 @@ def association_aux_loss(
         return torch.tensor(0.0, device=association_target.device, requires_grad=True)
 
     target = association_target.unsqueeze(0).expand_as(association_hat)
-    F_dim = target.size(-1)
+    n_f = target.size(-1)
 
     if ignore_diag:
-        mask = ~torch.eye(F_dim, dtype=torch.bool, device=target.device)
+        mask = ~torch.eye(n_f, dtype=torch.bool, device=target.device)
         return F.mse_loss(association_hat[:, mask], target[:, mask])
     return F.mse_loss(association_hat, target)
 
 
 def total_loss(
     out: ModelOutput,
-    x_true: torch.Tensor,  # [B, F]
-    obs_mask: torch.Tensor,  # [B, F]
-    binary_mask: torch.Tensor,  # [F]
+    x_true: torch.Tensor,  # [B, F] with AKI column = true label
+    obs_mask: torch.Tensor,  # [B, F] with AKI column = 1
     aki_true: torch.Tensor,  # [B]
     aki_idx: int,
     assoc_target: torch.Tensor | None = None,
@@ -405,9 +367,12 @@ def total_loss(
     lambda_aki: float = 1.0,
     lambda_assoc: float = 0.5,
 ) -> dict[str, torch.Tensor]:
-    """Compute all losses and return a dict for logging."""
-    l_rec = reconstruction_loss(out.x_hat, x_true, obs_mask, binary_mask, aki_idx)
-    l_aki = aki_loss(out.aki_prob, aki_true)
+    """
+    Su's loss: λ_rec · MSE(X̂, X_all_38) + λ_aki · CE(X̂_aki, AKI)
+               + optional λ_assoc · association_aux
+    """
+    l_rec = reconstruction_mse(out.x_hat, x_true, obs_mask)
+    l_aki = aki_ce_loss(out.x_hat[:, aki_idx], aki_true)
 
     l_assoc = torch.tensor(0.0, device=out.x_hat.device)
     if assoc_target is not None and out.association_hat is not None:

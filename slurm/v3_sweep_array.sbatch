@@ -6,58 +6,45 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=01:30:00
-#SBATCH --job-name=v10_%a
-#SBATCH --output=logs/v10_%a_%j.out
-#SBATCH --error=logs/v10_%a_%j.err
-#SBATCH --array=0-35
+#SBATCH --job-name=v10.1_%a
+#SBATCH --output=logs/v10.1_%a_%j.out
+#SBATCH --error=logs/v10.1_%a_%j.err
+#SBATCH --array=0-31
 
-# ── v3 sweep (array version) ──
-# 36 configs, each runs as a separate job.
-# ~20 min per job (5-fold CV).
-#
-# Usage:
-#   mkdir -p slurm results
-#   sbatch slurm/v3_sweep_array.sh
+# ── v10.1 sweep: simplified MSE + CE, 3 hops, iterative masking ──
+# 2×2×2×2×2 = 32 configs
 
 cd /N/project/depot/hw56/dualreasoning/dualr-graph
 source .venv_cpu/bin/activate
 mkdir -p results logs
 
-# Sweep grid: 3 × 2 × 3 × 2 = 36
-LAMBDA_REC_LIST=(0.5 1.0 2.0)
-LAMBDA_AKI_LIST=(1.0 2.0)
-LAMBDA_ASSOC_LIST=(0.0 0.5 1.0)
-DROPOUT_LIST=(0.0 0.1)
+LAMBDA_REC=(1.0 2.0)
+LAMBDA_AKI=(1.0 2.0)
+LAMBDA_ASSOC=(0.0 1.0)
+LAYERS=(2 3)
+NITER=(1 2)
 
 IDX=${SLURM_ARRAY_TASK_ID}
+i0=$(( IDX / 16 ));          r0=$(( IDX % 16 ))
+i1=$(( r0  / 8  ));          r1=$(( r0  % 8  ))
+i2=$(( r1  / 4  ));          r2=$(( r1  % 4  ))
+i3=$(( r2  / 2  ));          i4=$(( r2  % 2  ))
 
-# Decode linear index into grid coordinates.
-n_aki=${#LAMBDA_AKI_LIST[@]}
-n_assoc=${#LAMBDA_ASSOC_LIST[@]}
-n_do=${#DROPOUT_LIST[@]}
+LR=${LAMBDA_REC[$i0]}
+LA=${LAMBDA_AKI[$i1]}
+LAS=${LAMBDA_ASSOC[$i2]}
+LY=${LAYERS[$i3]}
+NI=${NITER[$i4]}
 
-i_rec=$((   IDX / (n_aki * n_assoc * n_do) ))
-remainder=$((IDX % (n_aki * n_assoc * n_do) ))
-i_aki=$((   remainder / (n_assoc * n_do) ))
-remainder=$((remainder % (n_assoc * n_do) ))
-i_assoc=$(( remainder / n_do ))
-i_do=$((    remainder % n_do ))
-
-LR=${LAMBDA_REC_LIST[$i_rec]}
-LA=${LAMBDA_AKI_LIST[$i_aki]}
-LAS=${LAMBDA_ASSOC_LIST[$i_assoc]}
-DO=${DROPOUT_LIST[$i_do]}
-
-NAME="v10_rec${LR}_aki${LA}_assoc${LAS}_do${DO}"
+NAME="v10.1_L${LY}_it${NI}_rec${LR}_aki${LA}_assoc${LAS}"
 
 echo "===== Job ${IDX}: ${NAME} at $(date) ====="
-echo "lambda_rec=${LR} lambda_aki=${LA} lambda_assoc=${LAS} dropout=${DO}"
 
 python train_v3.py \
     --edge_method llm \
     --use_edge_weights \
     --k 8 \
-    --layers 2 \
+    --layers ${LY} \
     --hidden 64 \
     --latent 16 \
     --lr 1e-3 \
@@ -71,10 +58,11 @@ python train_v3.py \
     --seed 42 \
     --verbose \
     --wandb \
+    --n_iter ${NI} \
     --lambda_rec ${LR} \
     --lambda_aki ${LA} \
     --lambda_assoc ${LAS} \
-    --dropout ${DO} \
+    --dropout 0.0 \
     --run_name ${NAME}
 
 echo "===== ${NAME} finished at $(date) ====="

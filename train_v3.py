@@ -192,54 +192,43 @@ def run_epoch(
     config: dict,
     device: torch.device,
     train: bool,
-    binary_mask_f: torch.Tensor,
     assoc_target: torch.Tensor | None,
 ):
-    """One epoch of training or evaluation.
-
-    x_true_all / obs_mask_all: [N, F] tensors for the FULL dataset.
-    We index into them per-batch using batch.y indices... actually we need
-    the original values. Let me store them in the dataset.
-
-    Actually — the batch already has batch.x which contains [value, obs_mask].
-    But AKI is masked to [0,0] in batch.x. We need the ORIGINAL x (before AKI
-    masking) as reconstruction target and the original obs_mask.
-
-    Strategy: pass x_true and obs_mask as separate tensors indexed by batch.
-    """
+    """One epoch. AKI true label is filled into reconstruction target."""
     model.train(train)
 
     totals = {"loss": 0.0, "rec_loss": 0.0, "aki_loss": 0.0, "assoc_loss": 0.0}
     y_true, y_prob = [], []
+    n_iter = config.get("n_iter", 1)
 
     for batch in loader:
         batch = batch.to(device)
         B = batch.num_graphs
         F_dim = model.n_features
+        aki_idx = model.aki_idx
 
         if train:
             optimizer.zero_grad(set_to_none=True)
 
-        # Forward pass — edge_weight is inside batch (PyG batched it).
-        out = model(batch)
+        # Forward pass with optional iterative refinement.
+        out = model(batch, n_iter=n_iter)
 
-        # Reconstruct x_true and obs_mask for this batch from batch.x.
-        # batch.x is [B*F, 2], reshaped to [B, F, 2].
+        # Build reconstruction target: start from batch input, then
+        # fill AKI column with TRUE label and set its obs_mask=1.
         batch_x_2d = batch.x.view(B, F_dim, 2)
-        # x_true for non-AKI features comes from the batch input (already correct).
-        # For AKI, the input was masked to [0,0], but we have y as the true label.
-        x_true_batch = batch_x_2d[:, :, 0]  # [B, F] — values
-        obs_mask_batch = batch_x_2d[:, :, 1]  # [B, F] — obs flags
+        x_true_batch = batch_x_2d[:, :, 0].clone()  # [B, F]
+        obs_mask_batch = batch_x_2d[:, :, 1].clone()  # [B, F]
 
-        aki_true = batch.y.view(-1)  # [B]
+        aki_true = batch.y.view(-1).float()  # [B]
+        x_true_batch[:, aki_idx] = aki_true  # fill AKI label
+        obs_mask_batch[:, aki_idx] = 1.0  # AKI counts in MSE
 
         parts = total_loss(
             out=out,
             x_true=x_true_batch,
             obs_mask=obs_mask_batch,
-            binary_mask=binary_mask_f,
-            aki_true=aki_true,
-            aki_idx=model.aki_idx,
+            aki_true=batch.y.view(-1),
+            aki_idx=aki_idx,
             assoc_target=assoc_target,
             lambda_rec=config["lambda_rec"],
             lambda_aki=config["lambda_aki"],
@@ -257,9 +246,10 @@ def run_epoch(
             totals[k] += parts[k].detach().item() * n
 
         y_prob.extend(out.aki_prob.detach().cpu().numpy().tolist())
-        y_true.extend(aki_true.detach().cpu().numpy().tolist())
+        y_true.extend(batch.y.view(-1).detach().cpu().numpy().tolist())
 
     n_total = max(1, len(y_true))
+
     metrics = {k: v / n_total for k, v in totals.items()}
     metrics["accuracy"] = accuracy_score(y_true, (np.array(y_prob) > 0.5).astype(int))
     metrics["auroc"] = safe_auroc(y_true, y_prob)
@@ -391,8 +381,6 @@ def train_one_fold(
     val_loader = make_loader(dataset, val_idx, config["batch_size"], shuffle=False)
     test_loader = make_loader(dataset, test_idx, config["batch_size"], shuffle=False)
 
-    binary_mask_device = binary_mask_f.to(device)
-
     model = build_model_v3(
         n_features=num_features,
         aki_idx=aki_idx,
@@ -423,7 +411,6 @@ def train_one_fold(
             config,
             device,
             train=True,
-            binary_mask_f=binary_mask_device,
             assoc_target=assoc_target,
         )
         scheduler.step()
@@ -436,7 +423,6 @@ def train_one_fold(
                 config,
                 device,
                 train=False,
-                binary_mask_f=binary_mask_device,
                 assoc_target=assoc_target,
             )
 
@@ -486,7 +472,6 @@ def train_one_fold(
         config,
         device,
         train=False,
-        binary_mask_f=binary_mask_device,
         assoc_target=assoc_target,
     )
 
@@ -665,17 +650,17 @@ def run_cv(config):
 
 
 def generate_sweep_configs(base_config: dict) -> list[dict]:
-    """Generate sweep grid for v3."""
+    """Generate sweep grid for v3 (v10.1 on wandb)."""
     configs = []
 
-    # The sweep explores the new loss structure.
-    # Architecture: use v5 winners (hidden=64, latent=16, layers=2, lr=1e-3).
-    # Topology: LLM edges with weights (proven best).
+    # v10.1: simplified MSE + CE, 3 hops, iterative masking.
+    # dropout fixed at 0.0 (v5 proved assoc regularizes enough).
     sweep_grid = {
-        "lambda_rec": [0.5, 1.0, 2.0],
+        "lambda_rec": [1.0, 2.0],
         "lambda_aki": [1.0, 2.0],
-        "lambda_assoc": [0.0, 0.5, 1.0],  # 0 = no auxiliary
-        "dropout": [0.0, 0.1],
+        "lambda_assoc": [0.0, 1.0],
+        "layers": [2, 3],
+        "n_iter": [1, 2],
     }
 
     from itertools import product
@@ -685,7 +670,12 @@ def generate_sweep_configs(base_config: dict) -> list[dict]:
         c = base_config.copy()
         for k, v in zip(keys, vals):
             c[k] = v
-        name = f"v10_rec{c['lambda_rec']}_aki{c['lambda_aki']}_assoc{c['lambda_assoc']}_do{c['dropout']}"
+        c["dropout"] = 0.0  # fixed
+        name = (
+            f"v10.1_L{c['layers']}_it{c['n_iter']}"
+            f"_rec{c['lambda_rec']}_aki{c['lambda_aki']}"
+            f"_assoc{c['lambda_assoc']}"
+        )
         c["run_name"] = name
         configs.append(c)
 
@@ -729,6 +719,12 @@ def parse_args():
     p.add_argument("--patience", type=int, default=40)
     p.add_argument("--eval_every", type=int, default=5)
     p.add_argument("--grad_clip", type=float, default=5.0)
+    p.add_argument(
+        "--n_iter",
+        type=int,
+        default=1,
+        help="Iterative refinement passes (1=standard, 2+=fill AKI from previous pass)",
+    )
 
     # CV / infra
     p.add_argument("--cv_folds", type=int, default=5)
