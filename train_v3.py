@@ -1,796 +1,568 @@
 #!/usr/bin/env python3
 """
-train_v3.py — Training script for Su's feature-graph autoencoder v3.
+models_v3.py — Feature-graph autoencoder for ICI→AKI prediction.
 
-Key differences from train_v2.py:
-  ① Feature value reconstruction loss (not association matrix reconstruction).
-  ② AKI prediction comes from reconstruction, not a separate MLP head.
-  ③ DirectedWeightedConv preserves P(v_i|v_j) edge weights and direction.
-  ④ Association loss is optional auxiliary regularization only.
-  ⑤ Simplified: no FLAG, no PCGrad, no FGSAM, no SWA — those proved marginal.
-     Focus the sweep on the new loss structure.
+v10.4 anti-collapse fixes:
+  ① Residual message-passing blocks: h_out = LayerNorm(skip(h_in) + dropout(ELU(conv(h_in))))
+  ② Jumping Knowledge: concatenate early-layer embeddings before final projection.
+  ③ Target-sum normalization for directed LLM edge weights to prevent message explosion.
+  ④ Optional DropEdge for structural regularization.
+  ⑤ Separate AKI attention head, so AKI prediction is not forced to come only from x_hat_aki.
+  ⑥ Contextual value decoder retained for reconstruction auxiliary.
+  ⑦ Optional association decoder retained for the proven v5-style regularizer.
 
-Usage:
-  python train_v3.py --edge_method llm --use_edge_weights \\
-      --lambda_rec 1.0 --lambda_aki 1.0 --lambda_assoc 0.5
-
-Sweep:
-  python train_v3.py --sweep
+Default recommended mode is hybrid:
+  - directed LLM topology for message passing
+  - association auxiliary as the main structural regularizer
+  - small value-reconstruction auxiliary
+  - AKI prediction from attention over non-AKI nodes + z_AKI
 """
 
 from __future__ import annotations
 
-import argparse
-import json
-import os
-import random
-import time
+import math
+from dataclasses import dataclass
 
-import numpy as np
-import pandas as pd
 import torch
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, average_precision_score, roc_auc_score
-from sklearn.model_selection import StratifiedKFold
-from torch_geometric.data import Data, Dataset
-from torch_geometric.loader import DataLoader
-
-try:
-    import wandb
-
-    HAS_WANDB = True
-except ImportError:
-    HAS_WANDB = False
-
-from graph import build_mi, build_spearman, knn_sparsify, load_llm_graph
-from models_v3 import FeatureGraphAutoencoderV3, build_model_v3, total_loss
-
-# ══════════════════════════════════════════════════════════════
-# Utilities
-# ══════════════════════════════════════════════════════════════
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GATv2Conv, MessagePassing
 
 
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+@dataclass
+class ModelOutput:
+    z: torch.Tensor  # [B*F, emb]
+    x_hat: torch.Tensor  # [B, F]
+    aki_prob: torch.Tensor  # [B]
+    aki_logit: torch.Tensor  # [B]
+    association_hat: torch.Tensor | None = None
+    attention: torch.Tensor | None = None  # [B, F-1], only for attention readout
 
 
-def safe_auroc(y, p) -> float:
-    return float(roc_auc_score(y, p)) if len(np.unique(y)) > 1 else float("nan")
+# ─────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────
 
 
-def safe_auprc(y, p) -> float:
-    return (
-        float(average_precision_score(y, p)) if len(np.unique(y)) > 1 else float("nan")
-    )
+def drop_edges(
+    edge_index: torch.Tensor, edge_weight: torch.Tensor | None, p: float, training: bool
+):
+    if (not training) or p <= 0:
+        return edge_index, edge_weight
+    n_edges = edge_index.size(1)
+    if n_edges == 0:
+        return edge_index, edge_weight
+    keep = torch.rand(n_edges, device=edge_index.device) > p
+    if keep.sum() == 0:
+        keep[torch.randint(n_edges, (1,), device=edge_index.device)] = True
+    edge_index = edge_index[:, keep]
+    if edge_weight is not None:
+        edge_weight = edge_weight[keep]
+    return edge_index, edge_weight
 
 
-# ══════════════════════════════════════════════════════════════
-# Preprocessing (same logic as v2)
-# ══════════════════════════════════════════════════════════════
+def target_sum_normalize(
+    edge_index: torch.Tensor, edge_weight: torch.Tensor | None, n_nodes: int
+):
+    """Normalize incoming edge weights so messages into each target sum to 1."""
+    if edge_weight is None:
+        edge_weight = torch.ones(
+            edge_index.size(1), device=edge_index.device, dtype=torch.float32
+        )
+    if edge_weight.dim() > 1:
+        edge_weight = edge_weight.view(-1)
+
+    target = edge_index[1]
+    denom = torch.zeros(n_nodes, device=edge_weight.device, dtype=edge_weight.dtype)
+    denom.index_add_(0, target, edge_weight)
+    return edge_weight / denom[target].clamp(min=1e-12)
 
 
-def preprocess_fold(X_nf, missing_nf, binary_mask_f, train_idx):
-    """Train-only z-score for continuous + mode imputation for binary."""
-    X = X_nf.float().numpy().copy()
-    missing = missing_nf.bool().numpy()
-    binary = binary_mask_f.bool().numpy()
-    observed = ~missing
+class PairNorm(nn.Module):
+    """Light PairNorm over feature nodes within each patient graph."""
 
-    x_scaled = np.zeros_like(X, dtype=np.float32)
-    obs_mask = observed.astype(np.float32)
-
-    for j in range(X.shape[1]):
-        train_obs = train_idx[observed[train_idx, j]]
-        vals = X[train_obs, j].astype(np.float64)
-
-        if binary[j]:
-            fill = float(np.round(vals.mean())) if len(vals) > 0 else 0.0
-            col = X[:, j].copy()
-            col[missing[:, j]] = fill
-            x_scaled[:, j] = col.astype(np.float32)
-        else:
-            mean = float(vals.mean()) if len(vals) > 0 else 0.0
-            std = float(vals.std()) if len(vals) > 0 else 1.0
-            if std < 1e-6:
-                std = 1.0
-            fill = float(np.median(vals)) if len(vals) > 0 else 0.0
-            col = X[:, j].copy()
-            col[observed[:, j]] = (col[observed[:, j]] - mean) / std
-            col[missing[:, j]] = (fill - mean) / std
-            x_scaled[:, j] = col.astype(np.float32)
-
-    return x_scaled, obs_mask
-
-
-def build_association_target(x_train_scaled: np.ndarray):
-    """Train-set |Pearson corr| for optional auxiliary loss."""
-    corr = np.corrcoef(x_train_scaled, rowvar=False)
-    corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
-    assoc = np.abs(corr).astype(np.float32)
-    np.fill_diagonal(assoc, 1.0)
-    return torch.from_numpy(assoc)
-
-
-# ══════════════════════════════════════════════════════════════
-# Dataset
-# ══════════════════════════════════════════════════════════════
-
-
-class FeatureGraphDataset(Dataset):
-    """Each patient is one graph; nodes are features."""
-
-    def __init__(self, x_scaled, obs_mask, y, edge_index, edge_weight=None):
+    def __init__(self, mode: str = "none", scale: float = 1.0, eps: float = 1e-6):
         super().__init__()
-        self.x_scaled = torch.from_numpy(x_scaled).float()
-        self.obs_mask = torch.from_numpy(obs_mask).float()
-        self.y = torch.from_numpy(y).long()
-        self.edge_index = edge_index.long()
-        self.edge_weight = edge_weight
-        self.n_features = x_scaled.shape[1]
-        self.feature_id = torch.arange(self.n_features, dtype=torch.long)
+        if mode not in ("none", "center", "scale"):
+            raise ValueError("pairnorm must be one of: none, center, scale")
+        self.mode = mode
+        self.scale = scale
+        self.eps = eps
 
-    def len(self):
-        return self.x_scaled.shape[0]
-
-    def get(self, idx):
-        values = self.x_scaled[idx].view(-1, 1)
-        mask = self.obs_mask[idx].view(-1, 1)
-        data = Data(
-            x=torch.cat([values, mask], dim=1),  # [F, 2]
-            edge_index=self.edge_index,
-            y=self.y[idx].view(1),
-            feature_id=self.feature_id,
-        )
-        if self.edge_weight is not None:
-            data.edge_weight = self.edge_weight
-        return data
-
-
-def make_loader(dataset, indices, batch_size, shuffle):
-    return DataLoader(
-        dataset.index_select(indices.tolist()), batch_size=batch_size, shuffle=shuffle
-    )
-
-
-# ══════════════════════════════════════════════════════════════
-# Graph construction
-# ══════════════════════════════════════════════════════════════
-
-
-def make_graph_for_fold(config, x_train_scaled, data_dir):
-    method = config["edge_method"]
-    if method in ("spearman", "mi"):
-        adj = (
-            build_spearman(x_train_scaled)
-            if method == "spearman"
-            else build_mi(x_train_scaled)
-        )
-        edge_index, edge_weight = knn_sparsify(adj, k=config["k"], directed=False)
-    elif method == "llm":
-        edge_index, edge_weight = load_llm_graph(
-            data_dir=data_dir,
-            k=config["k"],
-            cv_cutoff=config.get("cv_cutoff"),
-        )
-    else:
-        raise ValueError(f"Unknown edge_method={method!r}")
-    return edge_index.long(), edge_weight.float()
-
-
-# ══════════════════════════════════════════════════════════════
-# Training loop
-# ══════════════════════════════════════════════════════════════
-
-
-def run_epoch(
-    model: FeatureGraphAutoencoderV3,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer | None,
-    config: dict,
-    device: torch.device,
-    train: bool,
-    assoc_target: torch.Tensor | None,
-):
-    """One epoch. AKI true label is filled into reconstruction target."""
-    model.train(train)
-
-    totals = {"loss": 0.0, "rec_loss": 0.0, "aki_loss": 0.0, "assoc_loss": 0.0}
-    y_true, y_prob = [], []
-    n_iter = config.get("n_iter", 1)
-
-    for batch in loader:
-        batch = batch.to(device)
-        B = batch.num_graphs
-        F_dim = model.n_features
-        aki_idx = model.aki_idx
-
-        if train:
-            optimizer.zero_grad(set_to_none=True)
-
-        # Forward pass with optional iterative refinement.
-        out = model(batch, n_iter=n_iter)
-
-        # Build reconstruction target: start from batch input, then
-        # fill AKI column with TRUE label and set its obs_mask=1.
-        batch_x_2d = batch.x.view(B, F_dim, 2)
-        x_true_batch = batch_x_2d[:, :, 0].clone()  # [B, F]
-        obs_mask_batch = batch_x_2d[:, :, 1].clone()  # [B, F]
-
-        aki_true = batch.y.view(-1).float()  # [B]
-        x_true_batch[:, aki_idx] = aki_true  # fill AKI label
-        obs_mask_batch[:, aki_idx] = 1.0  # AKI counts in MSE
-
-        parts = total_loss(
-            out=out,
-            x_true=x_true_batch,
-            obs_mask=obs_mask_batch,
-            aki_true=batch.y.view(-1),
-            aki_idx=aki_idx,
-            assoc_target=assoc_target,
-            lambda_rec=config["lambda_rec"],
-            lambda_aki=config["lambda_aki"],
-            lambda_assoc=config["lambda_assoc"],
-        )
-
-        if train and torch.isfinite(parts["loss"]):
-            parts["loss"].backward()
-            if config["grad_clip"] > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
-            optimizer.step()
-
-        n = B
-        for k in totals:
-            totals[k] += parts[k].detach().item() * n
-
-        y_prob.extend(out.aki_prob.detach().cpu().numpy().tolist())
-        y_true.extend(batch.y.view(-1).detach().cpu().numpy().tolist())
-
-    n_total = max(1, len(y_true))
-
-    metrics = {k: v / n_total for k, v in totals.items()}
-    metrics["accuracy"] = accuracy_score(y_true, (np.array(y_prob) > 0.5).astype(int))
-    metrics["auroc"] = safe_auroc(y_true, y_prob)
-    metrics["auprc"] = safe_auprc(y_true, y_prob)
-    return metrics
-
-
-# ══════════════════════════════════════════════════════════════
-# Baselines
-# ══════════════════════════════════════════════════════════════
-
-
-def run_baselines(x_scaled, y, train_idx, val_idx, test_idx, aki_idx, config):
-    non_aki = [i for i in range(x_scaled.shape[1]) if i != aki_idx]
-    X_bl = x_scaled[:, non_aki]
-
-    best_lr_auc, best_lr = -1.0, None
-    for C in [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]:
-        lr = LogisticRegression(
-            max_iter=5000, class_weight="balanced", C=C, solver="lbfgs"
-        )
-        lr.fit(X_bl[train_idx], y[train_idx])
-        val_prob = lr.predict_proba(X_bl[val_idx])[:, 1]
-        val_auc = safe_auroc(y[val_idx], val_prob)
-        if np.isfinite(val_auc) and val_auc > best_lr_auc:
-            best_lr_auc, best_lr = val_auc, lr
-
-    if best_lr is None:
-        best_lr = LogisticRegression(
-            max_iter=5000, class_weight="balanced", C=1.0, solver="lbfgs"
-        )
-        best_lr.fit(X_bl[train_idx], y[train_idx])
-
-    lr_prob = best_lr.predict_proba(X_bl[test_idx])[:, 1]
-    lr_auc = safe_auroc(y[test_idx], lr_prob)
-    lr_auprc = safe_auprc(y[test_idx], lr_prob)
-
-    xgb_auc, xgb_auprc = float("nan"), float("nan")
-    try:
-        from xgboost import XGBClassifier
-
-        n_pos = int(y[train_idx].sum())
-        n_neg = int(len(train_idx) - n_pos)
-        spw = max(1.0, n_neg / max(1, n_pos))
-
-        best_xgb_val, best_xgb = -1.0, None
-        for md in [3, 4, 6]:
-            for lr_rate in [0.01, 0.05, 0.1]:
-                xgb = XGBClassifier(
-                    n_estimators=1000,
-                    max_depth=md,
-                    learning_rate=lr_rate,
-                    subsample=0.8,
-                    colsample_bytree=0.8,
-                    scale_pos_weight=spw,
-                    min_child_weight=5,
-                    reg_alpha=0.1,
-                    reg_lambda=1.0,
-                    eval_metric="logloss",
-                    verbosity=0,
-                    random_state=config["seed"],
-                    early_stopping_rounds=30,
-                )
-                xgb.fit(
-                    X_bl[train_idx],
-                    y[train_idx],
-                    eval_set=[(X_bl[val_idx], y[val_idx])],
-                    verbose=False,
-                )
-                val_prob = xgb.predict_proba(X_bl[val_idx])[:, 1]
-                val_auc = safe_auroc(y[val_idx], val_prob)
-                if np.isfinite(val_auc) and val_auc > best_xgb_val:
-                    best_xgb_val, best_xgb = val_auc, xgb
-
-        if best_xgb is not None:
-            xgb_prob = best_xgb.predict_proba(X_bl[test_idx])[:, 1]
-            xgb_auc = safe_auroc(y[test_idx], xgb_prob)
-            xgb_auprc = safe_auprc(y[test_idx], xgb_prob)
-    except Exception as e:
-        if config.get("verbose"):
-            print(f"  XGB skipped/failed: {e}")
-
-    return lr_auc, lr_auprc, xgb_auc, xgb_auprc
-
-
-# ══════════════════════════════════════════════════════════════
-# Single fold
-# ══════════════════════════════════════════════════════════════
-
-
-def train_one_fold(
-    fold,
-    config,
-    X_nf,
-    missing_nf,
-    binary_mask_f,
-    feature_names,
-    train_idx,
-    val_idx,
-    test_idx,
-    data_dir,
-    device,
-):
-    aki_idx = feature_names.index("aki_event")
-    num_features = X_nf.shape[1]
-
-    x_scaled, obs_mask = preprocess_fold(X_nf, missing_nf, binary_mask_f, train_idx)
-    y = X_nf[:, aki_idx].float().numpy().astype(np.int64)
-
-    # Build graph topology (LLM directed edges).
-    edge_index, edge_weight = make_graph_for_fold(config, x_scaled[train_idx], data_dir)
-
-    # Build association target for optional auxiliary loss.
-    assoc_target = None
-    if config["lambda_assoc"] > 0:
-        assoc_target = build_association_target(x_scaled[train_idx]).to(device)
-
-    # Mask AKI AFTER building association target.
-    x_scaled[:, aki_idx] = 0.0
-    obs_mask[:, aki_idx] = 0.0
-
-    # Edge weight for directed conv — stored in each Data, PyG batches it.
-    ew_for_dataset = edge_weight if config["use_edge_weights"] else None
-
-    dataset = FeatureGraphDataset(
-        x_scaled, obs_mask, y, edge_index, edge_weight=ew_for_dataset
-    )
-    train_loader = make_loader(dataset, train_idx, config["batch_size"], shuffle=True)
-    val_loader = make_loader(dataset, val_idx, config["batch_size"], shuffle=False)
-    test_loader = make_loader(dataset, test_idx, config["batch_size"], shuffle=False)
-
-    model = build_model_v3(
-        n_features=num_features,
-        aki_idx=aki_idx,
-        hidden_dim=config["hidden"],
-        embedding_dim=config["latent"],
-        n_layers=config["layers"],
-        dropout=config["dropout"],
-        encoder_type=config["encoder_type"],
-        pool_type=config["pool_type"],
-        n_heads=config.get("heads", 4),
-        use_assoc_aux=(config["lambda_assoc"] > 0),
-    ).to(device)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config["lr"],
-        weight_decay=config["weight_decay"],
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config["epochs"]
-    )
-
-    best_val_auc, best_epoch, best_state = -1.0, -1, None
-    patience_left = config["patience"]
-
-    for epoch in range(1, config["epochs"] + 1):
-        train_m = run_epoch(
-            model,
-            train_loader,
-            optimizer,
-            config,
-            device,
-            train=True,
-            assoc_target=assoc_target,
-        )
-        scheduler.step()
-
-        if epoch == 1 or epoch % config["eval_every"] == 0:
-            val_m = run_epoch(
-                model,
-                val_loader,
-                None,
-                config,
-                device,
-                train=False,
-                assoc_target=assoc_target,
+    def forward(self, x: torch.Tensor, batch_size: int, n_features: int):
+        if self.mode == "none":
+            return x
+        z = x.view(batch_size, n_features, -1)
+        z = z - z.mean(dim=1, keepdim=True)
+        if self.mode == "scale":
+            row_norm = (
+                z.pow(2)
+                .sum(dim=-1)
+                .mean(dim=1, keepdim=True)
+                .sqrt()
+                .clamp(min=self.eps)
             )
-
-            if config.get("wandb") and HAS_WANDB:
-                step = (fold - 1) * config["epochs"] + epoch
-                wandb.log(
-                    {
-                        f"fold{fold}/train_loss": train_m["loss"],
-                        f"fold{fold}/train_rec": train_m["rec_loss"],
-                        f"fold{fold}/train_aki": train_m["aki_loss"],
-                        f"fold{fold}/train_auroc": train_m["auroc"],
-                        f"fold{fold}/val_loss": val_m["loss"],
-                        f"fold{fold}/val_auroc": val_m["auroc"],
-                        f"fold{fold}/val_auprc": val_m["auprc"],
-                    },
-                    step=step,
-                )
-
-            if np.isfinite(val_m["auroc"]) and val_m["auroc"] > best_val_auc:
-                best_val_auc = val_m["auroc"]
-                best_epoch = epoch
-                best_state = {
-                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-                }
-                patience_left = config["patience"]
-            else:
-                patience_left -= 1
-
-            if config.get("verbose"):
-                print(
-                    f"    ep={epoch:03d} val_auc={val_m['auroc']:.4f} "
-                    f"best={best_val_auc:.4f} rec={val_m['rec_loss']:.4f} "
-                    f"aki={val_m['aki_loss']:.4f} assoc={val_m['assoc_loss']:.4f} "
-                    f"pat={patience_left}"
-                )
-
-            if patience_left <= 0:
-                break
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    test_m = run_epoch(
-        model,
-        test_loader,
-        None,
-        config,
-        device,
-        train=False,
-        assoc_target=assoc_target,
-    )
-
-    lr_auc, lr_auprc, xgb_auc, xgb_auprc = run_baselines(
-        x_scaled,
-        y,
-        train_idx,
-        val_idx,
-        test_idx,
-        aki_idx,
-        config,
-    )
-
-    return {
-        "fold": fold,
-        "auroc": test_m["auroc"],
-        "auprc": test_m["auprc"],
-        "accuracy": test_m["accuracy"],
-        "rec_loss": test_m["rec_loss"],
-        "aki_loss": test_m["aki_loss"],
-        "assoc_loss": test_m["assoc_loss"],
-        "best_val_auroc": float(best_val_auc),
-        "best_epoch": int(best_epoch),
-        "logreg_auroc": lr_auc,
-        "logreg_auprc": lr_auprc,
-        "xgb_auroc": xgb_auc,
-        "xgb_auprc": xgb_auprc,
-    }
+            z = self.scale * z / row_norm.unsqueeze(-1)
+        return z.reshape_as(x)
 
 
-# ══════════════════════════════════════════════════════════════
-# CV loop
-# ══════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
+# Directed weighted message passing
+# ─────────────────────────────────────────────────────────────
 
 
-def run_cv(config):
-    set_seed(config["seed"])
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() and not config.get("cpu") else "cpu"
-    )
-    data_dir = config["data_dir"]
+class DirectedWeightedConv(MessagePassing):
+    """v_i^(l+1) = W_self·v_i^(l) + Σ W_neigh·v_j^(l)·P(v_i|v_j)."""
 
-    X_fn = torch.load(
-        os.path.join(data_dir, "feature_matrix.pt"), weights_only=True
-    ).float()
-    binary_mask_f = torch.load(
-        os.path.join(data_dir, "binary_mask.pt"), weights_only=True
-    ).bool()
-    with open(os.path.join(data_dir, "feature_names.json")) as f:
-        feature_names = json.load(f)
-    aki_idx = feature_names.index("aki_event")
+    def __init__(self, in_dim: int, out_dim: int, edge_norm: str = "target_sum"):
+        super().__init__(aggr="add", flow="source_to_target")
+        if edge_norm not in ("none", "target_sum"):
+            raise ValueError("edge_norm must be 'none' or 'target_sum'")
+        self.edge_norm = edge_norm
+        self.w_self = nn.Linear(in_dim, out_dim)
+        self.w_neigh = nn.Linear(in_dim, out_dim)
 
-    miss_path = os.path.join(data_dir, "missing_mask.pt")
-    if os.path.exists(miss_path):
-        missing_fn = torch.load(miss_path, weights_only=True).bool()
-    else:
-        missing_fn = torch.zeros_like(X_fn, dtype=torch.bool)
+    def forward(self, x, edge_index, edge_weight=None):
+        if edge_weight is not None and edge_weight.dim() > 1:
+            edge_weight = edge_weight.view(-1)
+        if self.edge_norm == "target_sum":
+            edge_weight = target_sum_normalize(edge_index, edge_weight, x.size(0))
+        return self.w_self(x) + self.propagate(edge_index, x=x, edge_weight=edge_weight)
 
-    meta = pd.read_csv(os.path.join(data_dir, "cohort_meta.csv"))
-    y_all = X_fn[aki_idx].cpu().numpy().astype(np.int64)
-    eligible = (y_all == 1) | (meta["surv_days"].values >= config["landmark_days"])
-    eligible_idx = np.where(eligible)[0]
+    def message(self, x_j, edge_weight=None):
+        msg = self.w_neigh(x_j)
+        if edge_weight is not None:
+            msg = msg * edge_weight.view(-1, 1)
+        return msg
 
-    X_fn = X_fn[:, eligible_idx]
-    missing_fn = missing_fn[:, eligible_idx]
-    y_all = y_all[eligible_idx]
-    X_nf = X_fn.T.contiguous()
-    missing_nf = missing_fn.T.contiguous()
 
-    print("=" * 72)
-    print(
-        f"v10.2 | enc={config['encoder_type']} pool={config['pool_type']} L={config['layers']}"
-    )
-    print(
-        f"λ_rec={config['lambda_rec']} λ_aki={config['lambda_aki']} "
-        f"λ_assoc={config['lambda_assoc']} dropout={config['dropout']}"
-    )
-    print(
-        f"topology={config['edge_method']} k={config['k']} "
-        f"edge_weights={config['use_edge_weights']}"
-    )
-    print(f"N={X_nf.shape[0]} F={X_nf.shape[1]} AKI={y_all.mean():.3f} device={device}")
-    print("=" * 72)
+# ─────────────────────────────────────────────────────────────
+# Encoder blocks
+# ─────────────────────────────────────────────────────────────
 
-    if config.get("wandb") and HAS_WANDB:
-        run_name = (
-            config.get("run_name")
-            or f"v10_{config['lambda_rec']}_{config['lambda_aki']}_{config['lambda_assoc']}"
-        )
-        wandb.init(
-            project=config.get("wandb_project", "dualr-graph"),
-            name=run_name,
-            config=config,
-            reinit=True,
-        )
 
-    outer = StratifiedKFold(
-        n_splits=config["cv_folds"], shuffle=True, random_state=config["seed"]
-    )
-    fold_metrics = []
-
-    for fold, (trainval_idx, test_idx) in enumerate(
-        outer.split(np.zeros(len(y_all)), y_all), 1
+class DirectedGCNBlock(nn.Module):
+    def __init__(
+        self, in_dim, out_dim, dropout=0.1, residual=True, edge_norm="target_sum"
     ):
-        inner = StratifiedKFold(
-            n_splits=5, shuffle=True, random_state=config["seed"] + fold
+        super().__init__()
+        self.conv = DirectedWeightedConv(in_dim, out_dim, edge_norm=edge_norm)
+        self.norm = nn.LayerNorm(out_dim)
+        self.dropout = dropout
+        self.residual = residual
+        self.skip = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
+
+    def forward(self, x, edge_index, edge_weight=None):
+        h_msg = self.conv(x, edge_index, edge_weight)
+        h_msg = F.dropout(F.elu(h_msg), p=self.dropout, training=self.training)
+        if self.residual:
+            return self.norm(self.skip(x) + h_msg)
+        return F.dropout(
+            F.elu(self.norm(h_msg)), p=self.dropout, training=self.training
         )
-        train_rel, val_rel = next(
-            inner.split(np.zeros(len(trainval_idx)), y_all[trainval_idx])
+
+
+class GATv2Block(nn.Module):
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        heads=4,
+        dropout=0.1,
+        edge_dim=None,
+        residual=True,
+    ):
+        super().__init__()
+        head_out = max(1, out_dim // heads)
+        self.conv = GATv2Conv(
+            in_dim,
+            head_out,
+            heads=heads,
+            concat=True,
+            dropout=dropout,
+            edge_dim=edge_dim,
+            residual=True,
         )
-        train_idx, val_idx = trainval_idx[train_rel], trainval_idx[val_rel]
-
-        print(
-            f"\nFold {fold}/{config['cv_folds']}: "
-            f"train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}"
+        actual_out = head_out * heads
+        self.proj = (
+            nn.Linear(actual_out, out_dim) if actual_out != out_dim else nn.Identity()
         )
-        t0 = time.time()
-        metrics = train_one_fold(
-            fold,
-            config,
-            X_nf,
-            missing_nf,
-            binary_mask_f,
-            feature_names,
-            train_idx,
-            val_idx,
-            test_idx,
-            data_dir,
-            device,
+        self.norm = nn.LayerNorm(out_dim)
+        self.dropout = dropout
+        self.residual = residual
+        self.skip = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
+
+    def forward(self, x, edge_index, edge_weight=None):
+        edge_attr = edge_weight.view(-1, 1) if edge_weight is not None else None
+        h_msg = self.proj(self.conv(x, edge_index, edge_attr=edge_attr))
+        h_msg = F.dropout(F.elu(h_msg), p=self.dropout, training=self.training)
+        if self.residual:
+            return self.norm(self.skip(x) + h_msg)
+        return F.dropout(
+            F.elu(self.norm(h_msg)), p=self.dropout, training=self.training
         )
-        metrics["time_s"] = time.time() - t0
-        fold_metrics.append(metrics)
 
-        print(f"  GNN  AUROC={metrics['auroc']:.4f}  AUPRC={metrics['auprc']:.4f}")
-        print(f"  LR   AUROC={metrics['logreg_auroc']:.4f}")
-        if np.isfinite(metrics.get("xgb_auroc", float("nan"))):
-            print(f"  XGB  AUROC={metrics['xgb_auroc']:.4f}")
 
-    aurocs = np.array([m["auroc"] for m in fold_metrics])
-    lr_aurocs = np.array([m["logreg_auroc"] for m in fold_metrics])
-    xgb_aurocs = np.array([m.get("xgb_auroc", float("nan")) for m in fold_metrics])
+# ─────────────────────────────────────────────────────────────
+# Decoders and heads
+# ─────────────────────────────────────────────────────────────
 
-    summary = {
-        "strategy": config.get("run_name") or "v10",
-        "auroc_mean": float(np.nanmean(aurocs)),
-        "auroc_std": float(np.nanstd(aurocs)),
-        "auprc_mean": float(np.nanmean([m["auprc"] for m in fold_metrics])),
-        "auprc_std": float(np.nanstd([m["auprc"] for m in fold_metrics])),
-        "logreg_auroc_mean": float(np.nanmean(lr_aurocs)),
-        "delta_vs_logreg": float(np.nanmean(aurocs - lr_aurocs)),
-        "folds": fold_metrics,
-        "config": config,
-    }
-    if np.any(np.isfinite(xgb_aurocs)):
-        summary["xgb_auroc_mean"] = float(np.nanmean(xgb_aurocs))
-        summary["delta_vs_xgb"] = float(np.nanmean(aurocs - xgb_aurocs))
 
-    print(f"\n{'='*72}")
-    print(f"GNN  AUROC: {summary['auroc_mean']:.4f} ± {summary['auroc_std']:.4f}")
-    print(f"LR   AUROC: {summary['logreg_auroc_mean']:.4f}")
-    if "xgb_auroc_mean" in summary:
-        print(f"XGB  AUROC: {summary['xgb_auroc_mean']:.4f}")
-    print(f"Δ vs LR:    {summary['delta_vs_logreg']:+.4f}")
-    print(f"{'='*72}")
+class ContextualValueDecoder(nn.Module):
+    """decoder(z_j, global_context) → x̂_j."""
 
-    if config.get("wandb") and HAS_WANDB:
-        wandb.summary.update(
-            {k: v for k, v in summary.items() if k not in ("folds", "config")}
+    POOL_TYPES = ("mean", "max", "mean_max")
+
+    def __init__(self, embedding_dim: int, hidden_dim: int, pool_type: str = "mean"):
+        super().__init__()
+        if pool_type not in self.POOL_TYPES:
+            raise ValueError(f"pool_type must be one of {self.POOL_TYPES}")
+        self.pool_type = pool_type
+        ctx_dim = embedding_dim if pool_type in ("mean", "max") else 2 * embedding_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(embedding_dim + ctx_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
         )
-        wandb.finish()
 
-    return summary
-
-
-# ══════════════════════════════════════════════════════════════
-# Sweep configs
-# ══════════════════════════════════════════════════════════════
-
-
-def generate_sweep_configs(base_config: dict) -> list[dict]:
-    """Generate sweep grid for v10.2: contextual decoder + GAT."""
-    configs = []
-
-    # v10.1 winners: lambda_rec=1.0, lambda_aki=2.0, lambda_assoc=0.0, n_iter=1
-    # v10.2 tests: pool_type, encoder_type, layers, dropout
-    sweep_grid = {
-        "pool_type": ["mean", "max", "mean_max"],
-        "encoder_type": ["directed", "gatv2"],
-        "layers": [2, 3],
-        "dropout": [0.0, 0.05],
-    }
-
-    from itertools import product
-
-    keys = list(sweep_grid.keys())
-    for vals in product(*[sweep_grid[k] for k in keys]):
-        c = base_config.copy()
-        for k, v in zip(keys, vals):
-            c[k] = v
-        # Lock v10.1 winners
-        c["lambda_rec"] = 1.0
-        c["lambda_aki"] = 2.0
-        c["lambda_assoc"] = 0.0
-        c["n_iter"] = 1
-        name = (
-            f"v10.2_{c['encoder_type']}_L{c['layers']}"
-            f"_{c['pool_type']}_do{c['dropout']}"
+    def forward(
+        self, z: torch.Tensor, batch_size: int, n_features: int
+    ) -> torch.Tensor:
+        z_bg = z.view(batch_size, n_features, -1)
+        if self.pool_type == "mean":
+            ctx = z_bg.mean(dim=1)
+        elif self.pool_type == "max":
+            ctx = z_bg.max(dim=1).values
+        else:
+            ctx = torch.cat([z_bg.mean(dim=1), z_bg.max(dim=1).values], dim=-1)
+        ctx_exp = ctx.unsqueeze(1).expand(-1, n_features, -1)
+        combined = torch.cat([z_bg, ctx_exp], dim=-1)
+        return self.mlp(combined.reshape(-1, combined.size(-1))).view(
+            batch_size, n_features
         )
-        c["run_name"] = name
-        configs.append(c)
-
-    return configs
 
 
-# ══════════════════════════════════════════════════════════════
-# CLI
-# ══════════════════════════════════════════════════════════════
+class SymmetricAssociationDecoder(nn.Module):
+    def forward(self, z_by_graph):
+        d = z_by_graph.size(-1)
+        return torch.sigmoid(z_by_graph @ z_by_graph.transpose(1, 2) / math.sqrt(d))
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Feature-graph AE v3 (Su's design)")
+class AKIAttentionHead(nn.Module):
+    """Predict AKI from z_AKI plus attention over non-AKI feature nodes."""
 
-    # Data
-    p.add_argument("--data_dir", default="data")
-    p.add_argument("--landmark_days", type=int, default=180)
+    READOUTS = ("attention", "concat")
 
-    # Topology
-    p.add_argument("--edge_method", default="llm", choices=["llm", "spearman", "mi"])
-    p.add_argument("--k", type=int, default=8)
-    p.add_argument("--use_edge_weights", action="store_true")
-    p.add_argument("--cv_cutoff", type=float, default=None)
+    def __init__(
+        self,
+        embedding_dim: int,
+        hidden_dim: int,
+        n_features: int,
+        aki_idx: int,
+        mode: str = "attention",
+    ):
+        super().__init__()
+        if mode not in self.READOUTS:
+            raise ValueError(f"mode must be one of {self.READOUTS}")
+        self.mode = mode
+        self.n_features = n_features
+        self.aki_idx = aki_idx
+        self.query = nn.Linear(embedding_dim, embedding_dim, bias=False)
+        self.key = nn.Linear(embedding_dim, embedding_dim, bias=False)
+        self.value = nn.Linear(embedding_dim, embedding_dim, bias=False)
+        if mode == "attention":
+            in_dim = 3 * embedding_dim  # z_aki, attended context, mean context
+        else:
+            in_dim = 3 * embedding_dim  # z_aki, mean context, max context
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
 
-    # Model
-    p.add_argument("--layers", type=int, default=3)
-    p.add_argument("--hidden", type=int, default=64)
-    p.add_argument("--latent", type=int, default=16)
-    p.add_argument("--dropout", type=float, default=0.0)
-    p.add_argument("--encoder_type", default="directed", choices=["directed", "gatv2"])
-    p.add_argument("--pool_type", default="mean", choices=["mean", "max", "mean_max"])
-    p.add_argument("--heads", type=int, default=4)
+    def forward(self, z_by_graph: torch.Tensor):
+        mask = torch.ones(self.n_features, dtype=torch.bool, device=z_by_graph.device)
+        mask[self.aki_idx] = False
+        z_aki = z_by_graph[:, self.aki_idx, :]
+        z_other = z_by_graph[:, mask, :]
 
-    # Loss weights
-    p.add_argument("--lambda_rec", type=float, default=1.0)
-    p.add_argument("--lambda_aki", type=float, default=1.0)
-    p.add_argument("--lambda_assoc", type=float, default=0.5)
+        mean_ctx = z_other.mean(dim=1)
+        if self.mode == "concat":
+            max_ctx = z_other.max(dim=1).values
+            logit = self.mlp(torch.cat([z_aki, mean_ctx, max_ctx], dim=-1)).squeeze(-1)
+            return logit, None
 
-    # Training
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--epochs", type=int, default=500)
-    p.add_argument("--batch_size", type=int, default=128)
-    p.add_argument("--patience", type=int, default=40)
-    p.add_argument("--eval_every", type=int, default=5)
-    p.add_argument("--grad_clip", type=float, default=5.0)
-    p.add_argument(
-        "--n_iter",
-        type=int,
-        default=1,
-        help="Iterative refinement passes (1=standard, 2+=fill AKI from previous pass)",
+        q = self.query(z_aki).unsqueeze(1)
+        k = self.key(z_other)
+        v = self.value(z_other)
+        scores = (q * k).sum(dim=-1) / math.sqrt(z_by_graph.size(-1))
+        attn = torch.softmax(scores, dim=-1)
+        attn_ctx = torch.sum(attn.unsqueeze(-1) * v, dim=1)
+        logit = self.mlp(torch.cat([z_aki, attn_ctx, mean_ctx], dim=-1)).squeeze(-1)
+        return logit, attn
+
+
+# ─────────────────────────────────────────────────────────────
+# Main model
+# ─────────────────────────────────────────────────────────────
+
+
+class FeatureGraphAutoencoderV3(nn.Module):
+    AKI_READOUTS = ("reconstruct", "attention", "concat")
+    JK_MODES = ("last", "concat", "max")
+
+    def __init__(
+        self,
+        n_features: int,
+        aki_idx: int,
+        hidden_dim: int = 64,
+        embedding_dim: int = 16,
+        n_layers: int = 2,
+        dropout: float = 0.1,
+        encoder_type: str = "directed",
+        pool_type: str = "mean",
+        n_heads: int = 4,
+        use_assoc_aux: bool = False,
+        residual: bool = True,
+        jk_mode: str = "concat",
+        edge_norm: str = "target_sum",
+        edge_dropout: float = 0.0,
+        pairnorm: str = "none",
+        aki_readout: str = "attention",
+    ):
+        super().__init__()
+        if jk_mode not in self.JK_MODES:
+            raise ValueError(f"jk_mode must be one of {self.JK_MODES}")
+        if aki_readout not in self.AKI_READOUTS:
+            raise ValueError(f"aki_readout must be one of {self.AKI_READOUTS}")
+
+        self.n_features = n_features
+        self.aki_idx = aki_idx
+        self.embedding_dim = embedding_dim
+        self.use_assoc_aux = use_assoc_aux
+        self.jk_mode = jk_mode
+        self.edge_dropout = edge_dropout
+        self.aki_readout = aki_readout
+        self.encoder_type = encoder_type
+
+        self.feature_embedding = nn.Embedding(n_features, hidden_dim)
+        self.input_proj = nn.Linear(2 + hidden_dim, hidden_dim)
+        self.pairnorm = PairNorm(pairnorm)
+
+        blocks = []
+        for _ in range(n_layers):
+            if encoder_type == "directed":
+                blocks.append(
+                    DirectedGCNBlock(
+                        hidden_dim,
+                        hidden_dim,
+                        dropout=dropout,
+                        residual=residual,
+                        edge_norm=edge_norm,
+                    )
+                )
+            elif encoder_type == "gatv2":
+                blocks.append(
+                    GATv2Block(
+                        hidden_dim,
+                        hidden_dim,
+                        heads=n_heads,
+                        dropout=dropout,
+                        edge_dim=1,
+                        residual=residual,
+                    )
+                )
+            else:
+                raise ValueError(f"Unknown encoder_type={encoder_type}")
+        self.encoder = nn.ModuleList(blocks)
+
+        if jk_mode == "concat":
+            self.jk_proj = nn.Linear(hidden_dim * n_layers, embedding_dim)
+        else:
+            self.jk_proj = nn.Linear(hidden_dim, embedding_dim)
+
+        self.value_decoder = ContextualValueDecoder(
+            embedding_dim, hidden_dim, pool_type
+        )
+        if use_assoc_aux:
+            self.assoc_decoder = SymmetricAssociationDecoder()
+
+        if aki_readout in ("attention", "concat"):
+            self.aki_head = AKIAttentionHead(
+                embedding_dim=embedding_dim,
+                hidden_dim=hidden_dim,
+                n_features=n_features,
+                aki_idx=aki_idx,
+                mode=("attention" if aki_readout == "attention" else "concat"),
+            )
+
+    def encode(
+        self, x, edge_index, feature_id, edge_weight=None, batch_size: int | None = None
+    ):
+        identity = self.feature_embedding(feature_id)
+        h = F.relu(self.input_proj(torch.cat([x, identity], dim=-1)))
+
+        edge_index_use, edge_weight_use = drop_edges(
+            edge_index, edge_weight, self.edge_dropout, self.training
+        )
+
+        layer_outputs = []
+        for block in self.encoder:
+            h = block(h, edge_index_use, edge_weight_use)
+            if batch_size is not None:
+                h = self.pairnorm(h, batch_size, self.n_features)
+            layer_outputs.append(h)
+
+        if self.jk_mode == "concat":
+            h_jk = torch.cat(layer_outputs, dim=-1)
+        elif self.jk_mode == "max":
+            h_jk = torch.stack(layer_outputs, dim=0).max(dim=0).values
+        else:
+            h_jk = layer_outputs[-1]
+        return self.jk_proj(h_jk)
+
+    def decode(self, z, batch_size):
+        return self.value_decoder(z, batch_size, self.n_features)
+
+    def forward(self, batch, n_iter: int = 1) -> ModelOutput:
+        edge_weight = getattr(batch, "edge_weight", None)
+        if edge_weight is not None and edge_weight.dim() > 1:
+            edge_weight = edge_weight.view(-1)
+        x_current = batch.x
+
+        for iteration in range(n_iter):
+            z = self.encode(
+                x_current,
+                batch.edge_index,
+                batch.feature_id,
+                edge_weight,
+                batch_size=batch.num_graphs,
+            )
+            x_hat = self.decode(z, batch.num_graphs)
+            if iteration < n_iter - 1:
+                x_filled = x_current.clone()
+                aki_pos = (batch.feature_id == self.aki_idx).nonzero(as_tuple=True)[0]
+                x_filled[aki_pos, 0] = torch.sigmoid(x_hat[:, self.aki_idx]).detach()
+                x_filled[aki_pos, 1] = 1.0
+                x_current = x_filled
+
+        z_by_graph = z.view(batch.num_graphs, self.n_features, -1)
+        attention = None
+        if self.aki_readout == "reconstruct":
+            aki_logit = x_hat[:, self.aki_idx]
+        else:
+            aki_logit, attention = self.aki_head(z_by_graph)
+        aki_prob = torch.sigmoid(aki_logit)
+
+        assoc = None
+        if self.use_assoc_aux:
+            assoc = self.assoc_decoder(z_by_graph)
+
+        return ModelOutput(
+            z=z,
+            x_hat=x_hat,
+            aki_prob=aki_prob,
+            aki_logit=aki_logit,
+            association_hat=assoc,
+            attention=attention,
+        )
+
+
+# ─────────────────────────────────────────────────────────────
+# Loss functions
+# ─────────────────────────────────────────────────────────────
+
+
+def reconstruction_mse(x_hat, x_true, obs_mask):
+    """MSE over observed entries selected by obs_mask."""
+    diff_sq = (x_hat - x_true).pow(2)
+    masked = diff_sq * obs_mask
+    return masked.sum() / obs_mask.sum().clamp(min=1)
+
+
+def aki_ce_loss(aki_logit, aki_true):
+    return F.binary_cross_entropy_with_logits(
+        aki_logit, aki_true.float(), reduction="mean"
     )
 
-    # CV / infra
-    p.add_argument("--cv_folds", type=int, default=5)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--cpu", action="store_true")
-    p.add_argument("--verbose", action="store_true")
-    p.add_argument("--wandb", action="store_true")
-    p.add_argument("--wandb_project", default="dualr-graph")
-    p.add_argument("--run_name", default=None)
 
-    # Sweep mode
-    p.add_argument("--sweep", action="store_true", help="Run full sweep grid")
-
-    return p.parse_args()
+def association_aux_loss(association_hat, association_target, ignore_diag=True):
+    if association_hat is None:
+        return torch.tensor(0.0, device=association_target.device, requires_grad=True)
+    target = association_target.unsqueeze(0).expand_as(association_hat)
+    n_f = target.size(-1)
+    if ignore_diag:
+        mask = ~torch.eye(n_f, dtype=torch.bool, device=target.device)
+        return F.mse_loss(association_hat[:, mask], target[:, mask])
+    return F.mse_loss(association_hat, target)
 
 
-def main():
-    args = parse_args()
-    config = vars(args)
-
-    if config.pop("sweep", False):
-        # Run all sweep configs.
-        base = config.copy()
-        configs = generate_sweep_configs(base)
-        print(f"Sweep: {len(configs)} configs")
-        all_summaries = []
-        for i, c in enumerate(configs, 1):
-            print(f"\n{'#'*72}")
-            print(f"Sweep {i}/{len(configs)}: {c['run_name']}")
-            print(f"{'#'*72}")
-            summary = run_cv(c)
-            all_summaries.append(summary)
-            # Save each result individually.
-            os.makedirs("results", exist_ok=True)
-            with open(os.path.join("results", f"{c['run_name']}.json"), "w") as f:
-                json.dump(summary, f, indent=2)
-
-        # Print sweep summary sorted by AUROC.
-        print(f"\n{'='*72}")
-        print("SWEEP SUMMARY (sorted by AUROC)")
-        print(f"{'='*72}")
-        ranked = sorted(all_summaries, key=lambda s: s["auroc_mean"], reverse=True)
-        for s in ranked:
-            print(
-                f"  {s['auroc_mean']:.4f} ± {s['auroc_std']:.4f}  "
-                f"Δ_LR={s['delta_vs_logreg']:+.4f}  "
-                f"{s['strategy']}"
-            )
-    else:
-        summary = run_cv(config)
-        os.makedirs("results", exist_ok=True)
-        name = args.run_name or "v10"
-        with open(os.path.join("results", f"{name}.json"), "w") as f:
-            json.dump(summary, f, indent=2)
-        print(f"Saved: results/{name}.json")
+def total_loss(
+    out: ModelOutput,
+    x_true,
+    obs_mask,
+    aki_true,
+    assoc_target=None,
+    lambda_rec=0.1,
+    lambda_aki=1.0,
+    lambda_assoc=1.0,
+):
+    l_rec = reconstruction_mse(out.x_hat, x_true, obs_mask)
+    l_aki = aki_ce_loss(out.aki_logit, aki_true)
+    l_assoc = torch.tensor(0.0, device=out.x_hat.device)
+    if (
+        assoc_target is not None
+        and out.association_hat is not None
+        and lambda_assoc > 0
+    ):
+        l_assoc = association_aux_loss(out.association_hat, assoc_target)
+    l_total = lambda_rec * l_rec + lambda_aki * l_aki + lambda_assoc * l_assoc
+    return {
+        "loss": l_total,
+        "rec_loss": l_rec,
+        "aki_loss": l_aki,
+        "assoc_loss": l_assoc,
+    }
 
 
-if __name__ == "__main__":
-    main()
+# ─────────────────────────────────────────────────────────────
+# Builder
+# ─────────────────────────────────────────────────────────────
+
+
+def build_model_v3(
+    n_features: int,
+    aki_idx: int,
+    hidden_dim: int = 64,
+    embedding_dim: int = 16,
+    n_layers: int = 2,
+    dropout: float = 0.0,
+    encoder_type: str = "directed",
+    pool_type: str = "mean",
+    n_heads: int = 4,
+    use_assoc_aux: bool = False,
+    residual: bool = True,
+    jk_mode: str = "concat",
+    edge_norm: str = "target_sum",
+    edge_dropout: float = 0.0,
+    pairnorm: str = "none",
+    aki_readout: str = "attention",
+) -> FeatureGraphAutoencoderV3:
+    return FeatureGraphAutoencoderV3(
+        n_features=n_features,
+        aki_idx=aki_idx,
+        hidden_dim=hidden_dim,
+        embedding_dim=embedding_dim,
+        n_layers=n_layers,
+        dropout=dropout,
+        encoder_type=encoder_type,
+        pool_type=pool_type,
+        n_heads=n_heads,
+        use_assoc_aux=use_assoc_aux,
+        residual=residual,
+        jk_mode=jk_mode,
+        edge_norm=edge_norm,
+        edge_dropout=edge_dropout,
+        pairnorm=pairnorm,
+        aki_readout=aki_readout,
+    )
