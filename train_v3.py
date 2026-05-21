@@ -388,6 +388,9 @@ def train_one_fold(
         embedding_dim=config["latent"],
         n_layers=config["layers"],
         dropout=config["dropout"],
+        encoder_type=config["encoder_type"],
+        pool_type=config["pool_type"],
+        n_heads=config.get("heads", 4),
         use_assoc_aux=(config["lambda_assoc"] > 0),
     ).to(device)
 
@@ -542,7 +545,9 @@ def run_cv(config):
     missing_nf = missing_fn.T.contiguous()
 
     print("=" * 72)
-    print(f"v3 | DirConv + FeatureValueDecoder + AKI-from-recon")
+    print(
+        f"v10.2 | enc={config['encoder_type']} pool={config['pool_type']} L={config['layers']}"
+    )
     print(
         f"λ_rec={config['lambda_rec']} λ_aki={config['lambda_aki']} "
         f"λ_assoc={config['lambda_assoc']} dropout={config['dropout']}"
@@ -650,17 +655,16 @@ def run_cv(config):
 
 
 def generate_sweep_configs(base_config: dict) -> list[dict]:
-    """Generate sweep grid for v3 (v10.1 on wandb)."""
+    """Generate sweep grid for v10.2: contextual decoder + GAT."""
     configs = []
 
-    # v10.1: simplified MSE + CE, 3 hops, iterative masking.
-    # dropout fixed at 0.0 (v5 proved assoc regularizes enough).
+    # v10.1 winners: lambda_rec=1.0, lambda_aki=2.0, lambda_assoc=0.0, n_iter=1
+    # v10.2 tests: pool_type, encoder_type, layers, dropout
     sweep_grid = {
-        "lambda_rec": [1.0, 2.0],
-        "lambda_aki": [1.0, 2.0],
-        "lambda_assoc": [0.0, 1.0],
+        "pool_type": ["mean", "max", "mean_max"],
+        "encoder_type": ["directed", "gatv2"],
         "layers": [2, 3],
-        "n_iter": [1, 2],
+        "dropout": [0.0, 0.05],
     }
 
     from itertools import product
@@ -670,11 +674,14 @@ def generate_sweep_configs(base_config: dict) -> list[dict]:
         c = base_config.copy()
         for k, v in zip(keys, vals):
             c[k] = v
-        c["dropout"] = 0.0  # fixed
+        # Lock v10.1 winners
+        c["lambda_rec"] = 1.0
+        c["lambda_aki"] = 2.0
+        c["lambda_assoc"] = 0.0
+        c["n_iter"] = 1
         name = (
-            f"v10.1_L{c['layers']}_it{c['n_iter']}"
-            f"_rec{c['lambda_rec']}_aki{c['lambda_aki']}"
-            f"_assoc{c['lambda_assoc']}"
+            f"v10.2_{c['encoder_type']}_L{c['layers']}"
+            f"_{c['pool_type']}_do{c['dropout']}"
         )
         c["run_name"] = name
         configs.append(c)
@@ -701,10 +708,13 @@ def parse_args():
     p.add_argument("--cv_cutoff", type=float, default=None)
 
     # Model
-    p.add_argument("--layers", type=int, default=2)
+    p.add_argument("--layers", type=int, default=3)
     p.add_argument("--hidden", type=int, default=64)
     p.add_argument("--latent", type=int, default=16)
-    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--encoder_type", default="directed", choices=["directed", "gatv2"])
+    p.add_argument("--pool_type", default="mean", choices=["mean", "max", "mean_max"])
+    p.add_argument("--heads", type=int, default=4)
 
     # Loss weights
     p.add_argument("--lambda_rec", type=float, default=1.0)

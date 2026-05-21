@@ -6,45 +6,40 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=01:30:00
-#SBATCH --job-name=v10.1_%a
-#SBATCH --output=logs/v10.1_%a_%j.out
-#SBATCH --error=logs/v10.1_%a_%j.err
-#SBATCH --array=0-31
+#SBATCH --job-name=v10.2_%a
+#SBATCH --output=logs/v10.2_%a_%j.out
+#SBATCH --error=logs/v10.2_%a_%j.err
+#SBATCH --array=0-23
 
-# ── v10.1 sweep: simplified MSE + CE, 3 hops, iterative masking ──
-# 2×2×2×2×2 = 32 configs
+# ── v10.2: contextual decoder (mean/max/mean_max pool) + GAT ──
+# 3×2×2×2 = 24 configs. lambda_rec=1, lambda_aki=2, assoc=0 (v10.1 winners).
 
 cd /N/project/depot/hw56/dualreasoning/dualr-graph
 source .venv_cpu/bin/activate
 mkdir -p results logs
 
-LAMBDA_REC=(1.0 2.0)
-LAMBDA_AKI=(1.0 2.0)
-LAMBDA_ASSOC=(0.0 1.0)
+POOL=(mean max mean_max)
+ENC=(directed gatv2)
 LAYERS=(2 3)
-NITER=(1 2)
+DROP=(0.0 0.05)
 
 IDX=${SLURM_ARRAY_TASK_ID}
-i0=$(( IDX / 16 ));          r0=$(( IDX % 16 ))
-i1=$(( r0  / 8  ));          r1=$(( r0  % 8  ))
-i2=$(( r1  / 4  ));          r2=$(( r1  % 4  ))
-i3=$(( r2  / 2  ));          i4=$(( r2  % 2  ))
+i0=$(( IDX / 8 ));  r0=$(( IDX % 8 ))
+i1=$(( r0  / 4 ));  r1=$(( r0  % 4 ))
+i2=$(( r1  / 2 ));  i3=$(( r1  % 2 ))
 
-LR=${LAMBDA_REC[$i0]}
-LA=${LAMBDA_AKI[$i1]}
-LAS=${LAMBDA_ASSOC[$i2]}
-LY=${LAYERS[$i3]}
-NI=${NITER[$i4]}
+PL=${POOL[$i0]}
+EN=${ENC[$i1]}
+LY=${LAYERS[$i2]}
+DO=${DROP[$i3]}
 
-NAME="v10.1_L${LY}_it${NI}_rec${LR}_aki${LA}_assoc${LAS}"
-
+NAME="v10.2_${EN}_L${LY}_${PL}_do${DO}"
 echo "===== Job ${IDX}: ${NAME} at $(date) ====="
 
 python train_v3.py \
     --edge_method llm \
     --use_edge_weights \
     --k 8 \
-    --layers ${LY} \
     --hidden 64 \
     --latent 16 \
     --lr 1e-3 \
@@ -58,11 +53,14 @@ python train_v3.py \
     --seed 42 \
     --verbose \
     --wandb \
-    --n_iter ${NI} \
-    --lambda_rec ${LR} \
-    --lambda_aki ${LA} \
-    --lambda_assoc ${LAS} \
-    --dropout 0.0 \
+    --n_iter 1 \
+    --lambda_rec 1.0 \
+    --lambda_aki 2.0 \
+    --lambda_assoc 0.0 \
+    --encoder_type ${EN} \
+    --pool_type ${PL} \
+    --layers ${LY} \
+    --dropout ${DO} \
     --run_name ${NAME}
 
 echo "===== ${NAME} finished at $(date) ====="

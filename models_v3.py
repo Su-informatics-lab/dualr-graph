@@ -1,34 +1,13 @@
 #!/usr/bin/env python3
 """
-models_v3.py — Su's feature-graph autoencoder for ICI→AKI prediction.
+models_v3.py — Feature-graph autoencoder for ICI→AKI prediction.
 
-Key changes from v2:
-  ① DirectedWeightedConv: implements Su's message passing equation exactly:
-       v_i^(l+1) = W_self · v_i^(l) + Σ_{j∈N(i)} W_neigh · v_j^(l) · P(v_i|v_j)
-     No symmetrization. Direction and LLM edge weights preserved.
-
-  ② Feature value decoder: reconstructs X̂ ∈ R^{38} per patient from z,
-     NOT a 38×38 association matrix. Each node embedding z_j → x̂_j (scalar).
-
-  ③ AKI from reconstruction: x̂_aki → sigmoid → P(AKI). No separate MLP head.
-     The AKI prediction is a byproduct of feature reconstruction.
-
-  ④ Loss = λ_rec · L_rec + L_aki  (+ optional λ_assoc · L_assoc for regularization)
-     L_rec  = per-feature reconstruction (MSE for continuous, BCE for binary)
-     L_aki  = BCE(sigmoid(x̂_aki), AKI_label)  +  MSE(sigmoid(x̂_aki), AKI_label)
-     L_assoc = optional auxiliary: MSE(sigmoid(z@z.T/√d), |Pearson corr|)
-
-  ⑤ obs_mask as second input channel: [value, obs_mask] per node.
-     AKI is always [0, 0]. Missing features are [imputed_value, 0].
-     Model learns to reconstruct masked values from neighbor messages.
-
-Architecture (matching Su's sketches):
-  Input: [value, obs_mask] + feature identity embedding
-  → Linear projection → hidden_dim
-  → L directed GCN layers (LayerNorm + ELU, dropout)
-  → per-node embeddings z ∈ R^{38 × emb_dim}
-  → shared decoder MLP: z_j → x̂_j
-  → split loss: reconstruction (non-AKI) + AKI prediction
+v10.2 changes:
+  ① ContextualValueDecoder: decoder(z_j, global_pool(z)) → x̂_j
+     Pool types: mean, max, mean_max (concat both).
+  ② GATv2 encoder option alongside DirectedWeightedConv.
+  ③ Simplified loss: MSE on all 38 features + CE on AKI.
+  ④ Iterative forward for refinement.
 """
 
 from __future__ import annotations
@@ -39,19 +18,15 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import MessagePassing
-
-# ─────────────────────────────────────────────────────────────
-# Output container
-# ─────────────────────────────────────────────────────────────
+from torch_geometric.nn import GATv2Conv, MessagePassing
 
 
 @dataclass
 class ModelOutput:
-    z: torch.Tensor  # [B*F, emb] flat node embeddings
-    x_hat: torch.Tensor  # [B, F] reconstructed feature values (raw, pre-sigmoid)
-    aki_prob: torch.Tensor  # [B] sigmoid(x_hat[:, aki_idx])
-    association_hat: torch.Tensor | None = None  # [B, F, F] optional auxiliary
+    z: torch.Tensor
+    x_hat: torch.Tensor
+    aki_prob: torch.Tensor
+    association_hat: torch.Tensor | None = None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -60,44 +35,17 @@ class ModelOutput:
 
 
 class DirectedWeightedConv(MessagePassing):
-    """
-    Su's directed message passing:
-
-        v_i^(l+1) = W_self · v_i^(l)
-                   + Σ_{j ∈ N(i)} W_neigh · v_j^(l) · P(v_i | v_j)
-
-    edge_index: [2, E] where edge (j → i) means j is source, i is target.
-    edge_weight: [E] = P(v_i | v_j) for each edge.
-
-    No symmetrization. No self-loop injection. Direction fully preserved.
-    """
+    """v_i^(l+1) = W_self·v_i^(l) + Σ W_neigh·v_j^(l)·P(v_i|v_j)"""
 
     def __init__(self, in_dim: int, out_dim: int):
-        # aggr='add' sums messages; flow='source_to_target' means
-        # message goes from edge_index[0] to edge_index[1].
         super().__init__(aggr="add", flow="source_to_target")
         self.W_self = nn.Linear(in_dim, out_dim)
         self.W_neigh = nn.Linear(in_dim, out_dim)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_weight: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        # Self-loop transform (independent of graph structure).
-        out_self = self.W_self(x)
+    def forward(self, x, edge_index, edge_weight=None):
+        return self.W_self(x) + self.propagate(edge_index, x=x, edge_weight=edge_weight)
 
-        # Neighbor aggregation through directed edges.
-        out_neigh = self.propagate(edge_index, x=x, edge_weight=edge_weight)
-
-        return out_self + out_neigh
-
-    def message(
-        self, x_j: torch.Tensor, edge_weight: torch.Tensor | None
-    ) -> torch.Tensor:
-        # x_j: source node features [E, in_dim]
-        # edge_weight: P(v_i | v_j) [E]
+    def message(self, x_j, edge_weight=None):
         msg = self.W_neigh(x_j)
         if edge_weight is not None:
             msg = msg * edge_weight.unsqueeze(-1)
@@ -105,66 +53,107 @@ class DirectedWeightedConv(MessagePassing):
 
 
 # ─────────────────────────────────────────────────────────────
-# Encoder block
+# Encoder blocks
 # ─────────────────────────────────────────────────────────────
 
 
 class DirectedGCNBlock(nn.Module):
-    """One layer: DirectedWeightedConv → LayerNorm → ELU → Dropout."""
-
-    def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.1):
+    def __init__(self, in_dim, out_dim, dropout=0.1):
         super().__init__()
         self.conv = DirectedWeightedConv(in_dim, out_dim)
         self.norm = nn.LayerNorm(out_dim)
         self.dropout = dropout
+        self.conv_type = "directed"
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_weight: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def forward(self, x, edge_index, edge_weight=None):
         h = self.conv(x, edge_index, edge_weight)
-        h = F.elu(self.norm(h))
-        return F.dropout(h, p=self.dropout, training=self.training)
+        return F.dropout(F.elu(self.norm(h)), p=self.dropout, training=self.training)
 
 
-# ─────────────────────────────────────────────────────────────
-# Feature value decoder
-# ─────────────────────────────────────────────────────────────
-
-
-class FeatureValueDecoder(nn.Module):
-    """
-    Decode per-node embedding z_j ∈ R^emb → scalar x̂_j.
-
-    Shared MLP across all nodes. The feature identity is already
-    encoded in z_j by the encoder's identity embedding, so a shared
-    decoder can distinguish which feature it's reconstructing.
-    """
-
-    def __init__(self, embedding_dim: int, hidden_dim: int):
+class GATv2Block(nn.Module):
+    def __init__(
+        self, in_dim, out_dim, heads=4, dropout=0.1, edge_dim=None, is_last=False
+    ):
         super().__init__()
+        head_out = max(1, out_dim // heads)
+        self.conv = GATv2Conv(
+            in_dim,
+            head_out,
+            heads=heads,
+            concat=not is_last,
+            dropout=dropout,
+            edge_dim=edge_dim,
+            residual=True,
+        )
+        actual_out = head_out if is_last else head_out * heads
+        self.proj = (
+            nn.Linear(actual_out, out_dim) if actual_out != out_dim else nn.Identity()
+        )
+        self.norm = nn.LayerNorm(out_dim)
+        self.dropout = dropout
+        self.conv_type = "gatv2"
+
+    def forward(self, x, edge_index, edge_weight=None):
+        edge_attr = edge_weight.unsqueeze(-1) if edge_weight is not None else None
+        h = self.conv(x, edge_index, edge_attr=edge_attr)
+        h = self.proj(h)
+        return F.dropout(F.elu(self.norm(h)), p=self.dropout, training=self.training)
+
+
+# ─────────────────────────────────────────────────────────────
+# Contextual value decoder
+# ─────────────────────────────────────────────────────────────
+
+
+class ContextualValueDecoder(nn.Module):
+    """
+    decoder(z_j, global_context) → x̂_j
+
+    Each node sees its own embedding PLUS a global summary of the patient.
+    pool_type: 'mean', 'max', 'mean_max' (concat both).
+    """
+
+    POOL_TYPES = ("mean", "max", "mean_max")
+
+    def __init__(self, embedding_dim: int, hidden_dim: int, pool_type: str = "mean"):
+        super().__init__()
+        assert pool_type in self.POOL_TYPES
+        self.pool_type = pool_type
+        ctx_dim = embedding_dim if pool_type in ("mean", "max") else 2 * embedding_dim
         self.mlp = nn.Sequential(
-            nn.Linear(embedding_dim, hidden_dim),
+            nn.Linear(embedding_dim + ctx_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """z: [N_total, emb] → [N_total, 1] → squeeze to [N_total]."""
-        return self.mlp(z).squeeze(-1)
+    def forward(
+        self, z: torch.Tensor, batch_size: int, n_features: int
+    ) -> torch.Tensor:
+        z_bg = z.view(batch_size, n_features, -1)  # [B, F, emb]
+
+        if self.pool_type == "mean":
+            ctx = z_bg.mean(dim=1)  # [B, emb]
+        elif self.pool_type == "max":
+            ctx = z_bg.max(dim=1).values
+        else:
+            ctx = torch.cat(
+                [z_bg.mean(dim=1), z_bg.max(dim=1).values], dim=-1
+            )  # [B, 2*emb]
+
+        ctx_exp = ctx.unsqueeze(1).expand(-1, n_features, -1)  # [B, F, ctx]
+        combined = torch.cat([z_bg, ctx_exp], dim=-1)  # [B, F, emb+ctx]
+        return self.mlp(combined.reshape(-1, combined.size(-1))).view(
+            batch_size, n_features
+        )
 
 
 # ─────────────────────────────────────────────────────────────
-# Optional symmetric association decoder (auxiliary regularizer)
+# Association decoder (optional auxiliary)
 # ─────────────────────────────────────────────────────────────
 
 
 class SymmetricAssociationDecoder(nn.Module):
-    """sigmoid(z @ z.T / √d) — kept as optional auxiliary objective."""
-
-    def forward(self, z_by_graph: torch.Tensor) -> torch.Tensor:
+    def forward(self, z_by_graph):
         d = z_by_graph.size(-1)
         return torch.sigmoid(z_by_graph @ z_by_graph.transpose(1, 2) / math.sqrt(d))
 
@@ -175,13 +164,6 @@ class SymmetricAssociationDecoder(nn.Module):
 
 
 class FeatureGraphAutoencoderV3(nn.Module):
-    """
-    Su's feature-graph autoencoder.
-
-    Encode:  X (patient features on directed LLM graph) → z (per-node embeddings)
-    Decode:  z → X̂ (reconstructed feature values, including AKI)
-    Predict: P(AKI) = sigmoid(X̂_aki)
-    """
 
     def __init__(
         self,
@@ -191,7 +173,10 @@ class FeatureGraphAutoencoderV3(nn.Module):
         embedding_dim: int = 16,
         n_layers: int = 2,
         dropout: float = 0.1,
-        use_assoc_aux: bool = True,
+        encoder_type: str = "directed",
+        pool_type: str = "mean",
+        n_heads: int = 4,
+        use_assoc_aux: bool = False,
     ):
         super().__init__()
         self.n_features = n_features
@@ -199,157 +184,99 @@ class FeatureGraphAutoencoderV3(nn.Module):
         self.embedding_dim = embedding_dim
         self.use_assoc_aux = use_assoc_aux
 
-        # ── Input projection ──
-        # node_input = [value, obs_mask] (2 channels) + identity embedding
+        # Input projection
         self.feature_embedding = nn.Embedding(n_features, hidden_dim)
         self.input_proj = nn.Linear(2 + hidden_dim, hidden_dim)
 
-        # ── Directed GCN encoder ──
+        # Encoder
         blocks = []
         for i in range(n_layers):
-            in_d = (
-                hidden_dim
-                if i == 0
-                else (embedding_dim if i == n_layers - 1 else hidden_dim)
-            )
-            # First layer: hidden→hidden, last layer: hidden→embedding_dim
-            if i == 0:
-                in_d = hidden_dim
-                out_d = hidden_dim if n_layers > 1 else embedding_dim
-            elif i == n_layers - 1:
-                in_d = hidden_dim
-                out_d = embedding_dim
+            in_d = hidden_dim
+            out_d = embedding_dim if i == n_layers - 1 else hidden_dim
+            if encoder_type == "directed":
+                blocks.append(DirectedGCNBlock(in_d, out_d, dropout))
+            elif encoder_type == "gatv2":
+                blocks.append(
+                    GATv2Block(
+                        in_d,
+                        out_d,
+                        heads=n_heads,
+                        dropout=dropout,
+                        edge_dim=1,
+                        is_last=(i == n_layers - 1),
+                    )
+                )
             else:
-                in_d = hidden_dim
-                out_d = hidden_dim
-            blocks.append(DirectedGCNBlock(in_d, out_d, dropout))
+                raise ValueError(f"Unknown encoder_type={encoder_type}")
         self.encoder = nn.ModuleList(blocks)
 
-        # ── Feature value decoder ──
-        self.value_decoder = FeatureValueDecoder(embedding_dim, hidden_dim)
+        # Contextual decoder
+        self.value_decoder = ContextualValueDecoder(
+            embedding_dim, hidden_dim, pool_type
+        )
 
-        # ── Optional association decoder (auxiliary regularizer) ──
+        # Optional association auxiliary
         if use_assoc_aux:
             self.assoc_decoder = SymmetricAssociationDecoder()
 
-    def encode(
-        self,
-        x: torch.Tensor,  # [B*F, 2] = [value, obs_mask]
-        edge_index: torch.Tensor,  # [2, E]
-        feature_id: torch.Tensor,  # [B*F] feature indices 0..37
-        edge_weight: torch.Tensor | None = None,  # [E] = P(v_i|v_j)
-    ) -> torch.Tensor:
-        """Encode → per-node embeddings z ∈ R^{B*F × emb_dim}."""
-        # Concatenate node input with feature identity embedding.
-        identity = self.feature_embedding(feature_id)  # [B*F, hidden]
-        h = torch.cat([x, identity], dim=-1)  # [B*F, 2 + hidden]
-        h = F.relu(self.input_proj(h))  # [B*F, hidden]
-
-        # L layers of directed message passing.
+    def encode(self, x, edge_index, feature_id, edge_weight=None):
+        identity = self.feature_embedding(feature_id)
+        h = F.relu(self.input_proj(torch.cat([x, identity], dim=-1)))
         for block in self.encoder:
             h = block(h, edge_index, edge_weight)
+        return h
 
-        return h  # [B*F, emb_dim]
-
-    def decode(self, z: torch.Tensor, batch_size: int) -> torch.Tensor:
-        """Decode per-node embeddings to reconstructed feature values.
-
-        z: [B*F, emb_dim] → x_hat: [B, F] (raw logits, not sigmoid'd).
-        """
-        x_hat_flat = self.value_decoder(z)  # [B*F]
-        return x_hat_flat.view(batch_size, self.n_features)  # [B, F]
+    def decode(self, z, batch_size):
+        return self.value_decoder(z, batch_size, self.n_features)
 
     def forward(self, batch, n_iter: int = 1) -> ModelOutput:
-        """
-        Forward with optional iterative refinement.
-
-        n_iter=1: standard single pass (AKI masked).
-        n_iter=2+: pass 1 predicts X̂_aki, pass 2+ fills AKI with
-                   previous prediction and re-encodes for refined output.
-        """
         edge_weight = getattr(batch, "edge_weight", None)
-        x_current = batch.x  # [B*F, 2]
+        x_current = batch.x
 
         for iteration in range(n_iter):
-            z = self.encode(
-                x_current,
-                batch.edge_index,
-                batch.feature_id,
-                edge_weight=edge_weight,
-            )
-            x_hat = self.decode(z, batch.num_graphs)  # [B, F]
-
-            # If more iterations remain, fill AKI with current prediction.
+            z = self.encode(x_current, batch.edge_index, batch.feature_id, edge_weight)
+            x_hat = self.decode(z, batch.num_graphs)
             if iteration < n_iter - 1:
                 x_filled = x_current.clone()
-                # Find AKI node positions in the flat [B*F, 2] tensor.
-                aki_positions = (batch.feature_id == self.aki_idx).nonzero(
-                    as_tuple=True
-                )[0]
-                aki_preds = torch.sigmoid(x_hat[:, self.aki_idx]).detach()
-                x_filled[aki_positions, 0] = aki_preds  # fill value
-                x_filled[aki_positions, 1] = 1.0  # mark as "observed"
+                aki_pos = (batch.feature_id == self.aki_idx).nonzero(as_tuple=True)[0]
+                x_filled[aki_pos, 0] = torch.sigmoid(x_hat[:, self.aki_idx]).detach()
+                x_filled[aki_pos, 1] = 1.0
                 x_current = x_filled
 
-        aki_prob = torch.sigmoid(x_hat[:, self.aki_idx])  # [B]
+        aki_prob = torch.sigmoid(x_hat[:, self.aki_idx])
 
-        # Optional association matrix (auxiliary).
         assoc = None
         if self.use_assoc_aux:
-            z_by_graph = z.view(batch.num_graphs, self.n_features, -1)
-            assoc = self.assoc_decoder(z_by_graph)
+            z_bg = z.view(batch.num_graphs, self.n_features, -1)
+            assoc = self.assoc_decoder(z_bg)
 
-        return ModelOutput(
-            z=z,
-            x_hat=x_hat,
-            aki_prob=aki_prob,
-            association_hat=assoc,
-        )
+        return ModelOutput(z=z, x_hat=x_hat, aki_prob=aki_prob, association_hat=assoc)
 
 
 # ─────────────────────────────────────────────────────────────
-# Loss functions (Su's design: simple and unified)
+# Loss functions
 # ─────────────────────────────────────────────────────────────
 
 
-def reconstruction_mse(
-    x_hat: torch.Tensor,  # [B, F] raw decoder output
-    x_true: torch.Tensor,  # [B, F] true feature values (AKI filled with label)
-    obs_mask: torch.Tensor,  # [B, F] 1=observed, 0=missing
-) -> torch.Tensor:
-    """
-    Simple MSE over ALL 38 features, including AKI. No binary/continuous split.
-
-    Only observed features contribute (obs_mask=1). AKI's obs_mask should be
-    set to 1 with its true label as target before calling this.
-    """
+def reconstruction_mse(x_hat, x_true, obs_mask):
+    """MSE over all 38 features including AKI. Only observed entries."""
     diff_sq = (x_hat - x_true).pow(2)
     masked = diff_sq * obs_mask
     return masked.sum() / obs_mask.sum().clamp(min=1)
 
 
-def aki_ce_loss(
-    x_hat_aki: torch.Tensor,  # [B] raw logit (pre-sigmoid)
-    aki_true: torch.Tensor,  # [B] 0 or 1
-) -> torch.Tensor:
-    """CE on AKI as additional emphasis. Uses logits for numerical stability."""
+def aki_ce_loss(x_hat_aki, aki_true):
+    """CE on AKI as additional emphasis. Logits for numerical stability."""
     return F.binary_cross_entropy_with_logits(
         x_hat_aki, aki_true.float(), reduction="mean"
     )
 
 
-def association_aux_loss(
-    association_hat: torch.Tensor,
-    association_target: torch.Tensor,
-    ignore_diag: bool = True,
-) -> torch.Tensor:
-    """Optional auxiliary: regularize z@z.T to match train-set correlations."""
+def association_aux_loss(association_hat, association_target, ignore_diag=True):
     if association_hat is None:
         return torch.tensor(0.0, device=association_target.device, requires_grad=True)
-
     target = association_target.unsqueeze(0).expand_as(association_hat)
     n_f = target.size(-1)
-
     if ignore_diag:
         mask = ~torch.eye(n_f, dtype=torch.bool, device=target.device)
         return F.mse_loss(association_hat[:, mask], target[:, mask])
@@ -357,29 +284,22 @@ def association_aux_loss(
 
 
 def total_loss(
-    out: ModelOutput,
-    x_true: torch.Tensor,  # [B, F] with AKI column = true label
-    obs_mask: torch.Tensor,  # [B, F] with AKI column = 1
-    aki_true: torch.Tensor,  # [B]
-    aki_idx: int,
-    assoc_target: torch.Tensor | None = None,
-    lambda_rec: float = 1.0,
-    lambda_aki: float = 1.0,
-    lambda_assoc: float = 0.5,
-) -> dict[str, torch.Tensor]:
-    """
-    Su's loss: λ_rec · MSE(X̂, X_all_38) + λ_aki · CE(X̂_aki, AKI)
-               + optional λ_assoc · association_aux
-    """
+    out,
+    x_true,
+    obs_mask,
+    aki_true,
+    aki_idx,
+    assoc_target=None,
+    lambda_rec=1.0,
+    lambda_aki=2.0,
+    lambda_assoc=0.0,
+):
     l_rec = reconstruction_mse(out.x_hat, x_true, obs_mask)
     l_aki = aki_ce_loss(out.x_hat[:, aki_idx], aki_true)
-
     l_assoc = torch.tensor(0.0, device=out.x_hat.device)
     if assoc_target is not None and out.association_hat is not None:
         l_assoc = association_aux_loss(out.association_hat, assoc_target)
-
     l_total = lambda_rec * l_rec + lambda_aki * l_aki + lambda_assoc * l_assoc
-
     return {
         "loss": l_total,
         "rec_loss": l_rec,
@@ -399,8 +319,11 @@ def build_model_v3(
     hidden_dim: int = 64,
     embedding_dim: int = 16,
     n_layers: int = 2,
-    dropout: float = 0.1,
-    use_assoc_aux: bool = True,
+    dropout: float = 0.0,
+    encoder_type: str = "directed",
+    pool_type: str = "mean",
+    n_heads: int = 4,
+    use_assoc_aux: bool = False,
 ) -> FeatureGraphAutoencoderV3:
     return FeatureGraphAutoencoderV3(
         n_features=n_features,
@@ -409,5 +332,8 @@ def build_model_v3(
         embedding_dim=embedding_dim,
         n_layers=n_layers,
         dropout=dropout,
+        encoder_type=encoder_type,
+        pool_type=pool_type,
+        n_heads=n_heads,
         use_assoc_aux=use_assoc_aux,
     )
